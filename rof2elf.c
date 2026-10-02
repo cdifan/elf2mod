@@ -65,6 +65,7 @@
 #define T_RBSS		0x0002
 #define T_RDATA		0x0003
 #define T_CODE		0x0004
+#define T_SET		0x0005	/* a set label: an absolute value, like equ */
 #define T_EQU		0x0006
 #define T_COMMON	0x0100
 #define R_SIZE		0x0018	/* reference size */
@@ -482,7 +483,8 @@ add_equates (Rof *r)
 {
   int i;
   for (i = 0; i < r->ndefs; i++)
-    if ((r->defs[i].type & (T_KIND | T_COMMON)) == T_EQU)
+    if ((r->defs[i].type & (T_KIND | T_COMMON)) == T_EQU
+	|| (r->defs[i].type & (T_KIND | T_COMMON)) == T_SET)
       {
 	equs = realloc (equs, (nequs + 1) * sizeof (Equ));
 	equs[nequs].name = r->defs[i].name;
@@ -557,7 +559,7 @@ rof_to_elf (const char *file, Rof *r, Buf *out)
       if (d->type & T_COMMON)
 	add_sym (&e, d->name, 2, d->value, INFO (STB_GLOBAL, STT_OBJECT),
 		 SHN_COMMON);
-      else if (kind == T_EQU)
+      else if (kind == T_EQU || kind == T_SET)
 	add_sym (&e, d->name, d->value, 0, INFO (STB_GLOBAL, STT_NOTYPE),
 		 SHN_ABS);
       else if (target_section (kind) >= 0)
@@ -854,6 +856,7 @@ int
 main (int argc, char **argv)
 {
   const char *input = NULL, *output = NULL;
+  int is_library;
   int list = 0, i, nrofs = 0;
   unsigned char *data;
   long size;
@@ -904,6 +907,14 @@ main (int argc, char **argv)
       return 0;
     }
 
+  /* A library (.l) becomes an archive even with one ROF in it, so the
+     linker still only pulls it in when needed.  */
+  {
+    size_t n = strlen (input);
+    is_library = n > 2 && input[n - 2] == '.'
+		 && (input[n - 1] == 'l' || input[n - 1] == 'L');
+  }
+
   if (!output)
     {
       char *o = xmalloc (strlen (input) + 3);
@@ -912,7 +923,7 @@ main (int argc, char **argv)
       dot = strrchr (o, '.');
       if (!dot || strchr (dot, '/'))
 	dot = o + strlen (o);
-      strcpy (dot, nrofs > 1 ? ".a" : ".o");
+      strcpy (dot, nrofs > 1 || is_library ? ".a" : ".o");
       output = o;
     }
 

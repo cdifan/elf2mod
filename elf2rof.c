@@ -399,8 +399,9 @@ elf_to_rof (Obj *o, const char *name, Buf *out)
     for (i = 0; i < nsecs; i++)
       {
 	const char *n = (const char *) at (o, ss->offset, ss->size);
-	if (secs[i].nameoff >= ss->size)
-	  die ("%s: bad section name", o->file);
+	if (secs[i].nameoff >= ss->size
+	    || !memchr (n + secs[i].nameoff, 0, ss->size - secs[i].nameoff))
+	  die ("%s: bad section name", o->file);	/* also unterminated */
 	secs[i].name = n + secs[i].nameoff;
       }
   }
@@ -448,8 +449,8 @@ elf_to_rof (Obj *o, const char *name, Buf *out)
 	    const unsigned char *e = at (o, s->offset + j * 16, 16);
 	    Sym *y = &syms[j];
 	    uint32_t nm = get32 (e);
-	    if (nm >= st->size)
-	      die ("%s: bad symbol name", o->file);
+	    if (nm >= st->size || !memchr (strs + nm, 0, st->size - nm))
+	      die ("%s: bad symbol name", o->file);	/* also unterminated */
 	    y->name = strs + nm;
 	    y->value = get32 (e + 4);
 	    y->size = get32 (e + 8);

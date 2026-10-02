@@ -13,8 +13,8 @@ rof2elf -l INPUT
 ```
 
 - A single ROF object becomes an ELF relocatable (`cstart.r` → `cstart.o`).
-- A library (several ROFs concatenated) becomes an `ar` archive (`clib.l` → `clib.a`), with one
-  member per ROF. Run `ranlib` on it before linking.
+- A library (several ROFs concatenated, sometimes just one) becomes an `ar` archive
+  (`clib.l` → `clib.a`), with one member per ROF. Run `ranlib` on it before linking.
 - `-e EQUFILE` takes `equ` definitions from another ROF or library, usually `sys.l`, and folds
   references to them into the code. This is needed when code adds several equates in one place
   (e.g. `Dir_+Write_` in a mode byte), which an ELF relocation can't express. An equate
@@ -47,7 +47,7 @@ define the symbols Microware's linker provides, such as `end`.
 | uninitialized data | `.bss` |
 | remote initialized / uninitialized data | `.remote.data` / `.remote.bss` |
 | debug information | dropped |
-| global definitions | global symbols; `equ` definitions become absolute symbols, common definitions ELF common symbols |
+| global definitions | global symbols; `equ` definitions become absolute symbols (so do `set` definitions, which the manual documents, though Microware's assemblers don't export `set` labels), common definitions ELF common symbols |
 | external and local references | RELA relocations: `R_68K_8`, `R_68K_16`, `R_68K_32`, or `R_68K_PC8`, `R_68K_PC16`, `R_68K_PC32` for relative references; the addend is taken from the object bytes |
 
 - Data references are a6-relative. They come out right with a linker script that places `.data`
