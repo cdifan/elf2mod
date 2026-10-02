@@ -59,6 +59,10 @@ define the symbols Microware's linker provides, such as `end`.
   symbols `__os9_entry` and `__os9_trapent`, which elf2mod uses for the module header.
 
 The ROF format is described in the *OS-9 Assembler/Linker User Manual*, chapter 3, "Relocatable
-Object File Format". Section 6 of
+Object File Format", and in *Using Ultra C/C++*, chapter 6. rof2elf reads ROF edition 9, from
+Microware C 3.2's assembler, and 9.1 (series 0xF9), from Ultra C's r68 for the 68000, whose
+counts of symbols and references are 32 bits. It rejects other editions (9.2, which adds header
+fields, and 15). Ultra C's libraries are in a different container format, not supported yet.
+Section 6 of
 [OS9-COMPAT-DESIGN.md](https://github.com/cdifan/toolchaincdi/blob/main/OS9-COMPAT-DESIGN.md)
 describes the design.

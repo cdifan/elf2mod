@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <getopt.h>
+#include <sys/stat.h>
 #include <string.h>
 #include <ctype.h>
 
@@ -72,6 +73,8 @@ char *opt_name;
 int opt_stack = -1;
 int opt_revs = -1;
 int opt_edit = -1;
+int opt_stb = 0; // 1: as Microware C 3.2's l68, 2: as Ultra C's l68
+const char *opt_owner = NULL;
 #define DEFAULT_STACK 0x00000C00
 #define DEFAULT_REVS 1
 #define DEFAULT_EDIT 0
@@ -184,18 +187,69 @@ size_t make_idrefs(Vec *vec, IdRef *refs, size_t nrefs, int for_text) {
 	return iblock;
 }
 
+// The OS-9 module CRC of the first len bytes.
+uint32_t module_crc(const char *buf, size_t len) {
+	uint32_t crc = 0x00FFffff;
+	for(size_t i = 0; i < len; i++) {
+		crc ^= (uint32_t)(unsigned char)buf[i] << 16;
+		for(size_t j = 0; j < 8; j++) {
+			crc <<= 1;
+			if(crc & 0x01000000) {
+				crc ^= 0x00800063;
+			}
+		}
+	}
+	return ~crc & 0x00FFffff;
+}
+
+// Fill in a module header's size, name offset, parity and CRC (this
+// fork: shared by the program and symbol modules).
+uint32_t finish_module(Vec *vec, size_t iname, size_t icrc) {
+	struct modheader *mh = (void*)(vec->buf + 0);
+	mh->size = BE32(vec->len);
+	mh->name = BE32(iname);
+	uint16_t parity = 0xFFFF;
+	for(int i = 0; i < 0x2e / 2; i++) {
+		parity ^= ((uint16_t*)mh)[i];
+	}
+	mh->parity = parity; // don't BE16, already swapped
+	uint32_t crc = module_crc(vec->buf, vec->len - 3);
+	*(uint32_t*)(vec->buf + icrc) = BE32(crc);
+	return crc;
+}
+
+typedef struct stbsym {
+	int32_t value;
+	uint16_t type;
+	const char *name;
+	size_t rank; // linker symbols: their order; others: after them
+} StbSym;
+
+// By value; at the same value, as l68 lists them: Ultra C's in the order
+// it defines them (linker symbols first, then the others in definition
+// order, which in ROFs is by name), Microware C 3.2's in reverse.
+int stb_reverse;
+int cmp_stbsym(const void *a, const void *b) {
+	const StbSym *p = a, *q = b;
+	if(p->value != q->value) return p->value < q->value ? -1 : 1;
+	int c = p->rank != q->rank ? (p->rank < q->rank ? -1 : 1) : strcmp(p->name, q->name);
+	return stb_reverse ? -c : c;
+}
+
 int opt(int *argc, char ***argv) {
 	const struct option options[] = {
 		{ "name",  required_argument, NULL, 'n' },
 		{ "stack", required_argument, NULL, 's' },
 		{ "revs",  required_argument, NULL, 'r' },
 		{ "edit",  required_argument, NULL, 'e' },
+		{ "stb",   optional_argument, NULL, 'g' },
+		{ "owner", required_argument, NULL, 'u' },
 		{ "help",  no_argument,       NULL, 'h' },
 		{ 0, 0, 0, 0 },
 	};
 
 	for(;;) {
-		switch(getopt_long(*argc, *argv, "n:s:r:e:h", options, NULL)) {
+		switch(getopt_long(*argc, *argv, "n:s:r:e:gu:h", options, NULL)) {
 		case 'n':
 			opt_name = optarg;
 			break;
@@ -204,6 +258,17 @@ int opt(int *argc, char ***argv) {
 			break;
 		case 'r':
 			opt_revs = strtol(optarg, NULL, 0);
+			break;
+		case 'g':
+			if(!optarg || !strcmp(optarg, "c32")) opt_stb = 1;
+			else if(!strcmp(optarg, "ucc")) opt_stb = 2;
+			else {
+				printf("unknown symbol module style %s (c32 or ucc)\n", optarg);
+				return 0;
+			}
+			break;
+		case 'u':
+			opt_owner = optarg;
 			break;
 		case 'e':
 			opt_edit = strtol(optarg, NULL, 0);
@@ -217,6 +282,9 @@ int opt(int *argc, char ***argv) {
 			printf("  -s, --stack=STACKSIZE  set stack size, default __os9_stack or 0x%X\n", DEFAULT_STACK);
 			printf("  -r, --revs=REVISION    set module revision, default from __os9_attrev or %d\n", DEFAULT_REVS);
 			printf("  -e, --edit=EDITION     set module edition (not used by OS), default __os9_edition or %d\n", DEFAULT_EDIT);
+			printf("  -g, --stb[=STYLE]      also write a symbol module OUTFILE.stb for the debugger,\n");
+			printf("                         as Microware C 3.2's l68 (c32, default) or Ultra C's (ucc)\n");
+			printf("  -u, --owner=GROUP.USER set module owner, default $GRPUSER or 0.0\n");
 			printf("  -h, --help             show this help\n");
 			return 0;
 		case -1:
@@ -225,6 +293,18 @@ int opt(int *argc, char ***argv) {
 			return 1;
 		}
 	}
+}
+
+// The module owner from GROUP.USER (decimal, as l68's -gu and GRPUSER).
+int parse_owner(const char *s, uint32_t *owner) {
+	char *e;
+	unsigned long g = strtoul(s, &e, 10), u;
+	if(e == s || *e != '.') return 0;
+	s = e + 1;
+	u = strtoul(s, &e, 10);
+	if(e == s || *e || g > 0xFFFF || u > 0xFFFF) return 0;
+	*owner = g << 16 | u;
+	return 1;
 }
 
 int main(int argc, char *argv[]) {
@@ -239,6 +319,14 @@ int main(int argc, char *argv[]) {
 
 	if(!argv[1]) {
 		puts("OUTFILE not specified");
+		return 1;
+	}
+
+	// The owner: --owner, else GRPUSER as with l68, else 0.0.
+	uint32_t owner = 0;
+	if(!opt_owner) opt_owner = getenv("GRPUSER");
+	if(opt_owner && *opt_owner && !parse_owner(opt_owner, &owner)) {
+		printf("bad owner %s, expected GROUP.USER\n", opt_owner);
 		return 1;
 	}
 
@@ -366,9 +454,11 @@ int main(int argc, char *argv[]) {
 	long trelsz = bfd_get_reloc_upper_bound(abfd, text);
 	arelent **trels = malloc(trelsz);
 	long ntrels = bfd_canonicalize_reloc(abfd, text, trels, syms);
+	char *refd = calloc(nsyms + 1, 1); // symbols that relocations refer to (for -g)
 	for(long i = 0; i < ntrels; i++) {
 		arelent *rel = trels[i];
 		asection *ssec = rel->sym_ptr_ptr[0]->section;
+		if(rel->sym_ptr_ptr >= syms && rel->sym_ptr_ptr < syms + nsyms) refd[rel->sym_ptr_ptr - syms] = 1;
 		int constant = bfd_is_abs_section(ssec) || ssec == data || ssec == bss || (ssec && (ssec == rdata || ssec == rbss));
 		if(!(ssec == text || rel->howto->type == 2 /* R_68K_16(%a6) */
 		     || ((rel->howto->type == 1 /* R_68K_32 */ || rel->howto->type == 3 /* R_68K_8 */) && constant))) {
@@ -394,6 +484,7 @@ int main(int argc, char *argv[]) {
 				printf("%s relocation other than R_68K_32 not allowed: %s %08lx %s@%s+%08lx\n", sec->name, rel->howto->name, rel->address, rel->sym_ptr_ptr[0]->name, rel->sym_ptr_ptr[0]->section->name, rel->addend);
 				return 1;
 			}
+			if(rel->sym_ptr_ptr >= syms && rel->sym_ptr_ptr < syms + nsyms) refd[rel->sym_ptr_ptr - syms] = 1;
 			drefs[ndrefs].addr = DOFF(bfd_section_vma(sec)) + rel->address;
 			drefs[ndrefs].text = rel->sym_ptr_ptr[0]->section == text;
 			ndrefs++;
@@ -546,7 +637,7 @@ int main(int argc, char *argv[]) {
 	mh->magic = BE16(0x4AFC);
 	mh->sysrev = BE16(0x0001);
 	mh->size = BE32(vec->len);
-	mh->owner = BE32(0x00000000); // uid=0 gid=0
+	mh->owner = BE32(owner);
 	mh->name = BE32(iname);
 	mh->accs = BE16(0x0555); // r-xr-xr-x
 	uint16_t tylan = s_tylan ? bfd_asymbol_value(s_tylan) : 0x0101;
@@ -572,18 +663,123 @@ int main(int argc, char *argv[]) {
 	mh->irefs = BE32(iidrefs);
 
 	// update crc
-	uint32_t crc = 0x00FFffff;
-	for(size_t i = 0; i < vec->len - 3; i++) {
-		crc ^= (uint32_t)(unsigned char)vec->buf[i] << 16;
-		for(size_t j = 0; j < 8; j++) {
-			crc <<= 1;
-			if(crc & 0x01000000) {
-				crc ^= 0x00800063;
-			}
-		}
-	}
-	crc = ~crc & 0x00FFffff;
+	uint32_t crc = module_crc(vec->buf, vec->len - 3);
 	*(uint32_t*)(vec->buf + icrc) = BE32(crc);
+
+	// Symbol module (this fork, -g): an OS-9 data module named after the
+	// program module plus ".stb", as Microware's linker writes with -g
+	// (format in the OS-9/68000 User-State Debugger manual, appendix A):
+	// the STB format number, the program module's CRC, then the global
+	// symbols sorted by value (code: offsets in the module; data: a6-
+	// relative, i.e. their VMAs), then their names. The header's symbol
+	// field points to the STB header. The symbols the linker defines are
+	// added, flagged 0x2000: Microware C 3.2's l68 defines btext, bname,
+	// etext, end and _jmptbl, and also flags the symbols that other psects
+	// refer to (here: that relocations refer to); Ultra C's l68 also
+	// defines _btext, _bname, _etext, _bdata, bdata and _enddata.
+	if(opt_stb) {
+		bfd_vma jmptbl = dvma + dend;
+		for(long i = 0; i < nsyms; i++) {
+			if(!strcmp(bfd_asymbol_name(syms[i]), "_jmptbl")) jmptbl = bfd_asymbol_value(syms[i]);
+		}
+		const StbSym ucclinker[] = {
+			{ (int32_t)dvma, 0x2001, "_bdata", 0 }, { (int32_t)dvma, 0x2001, "bdata", 1 },
+			{ (int32_t)(dvma + dend), 0x2001, "_enddata", 2 }, { (int32_t)(dvma + dend), 0x2001, "end", 3 },
+			{ (int32_t)jmptbl, 0x2001, "_jmptbl", 4 },
+			{ 0, 0x2004, "_btext", 5 }, { 0, 0x2004, "btext", 6 },
+			{ (int32_t)iname, 0x2004, "_bname", 7 }, { (int32_t)iname, 0x2004, "bname", 8 },
+			{ (int32_t)vec->len, 0x2004, "_etext", 9 }, { (int32_t)vec->len, 0x2004, "etext", 10 },
+		};
+		const StbSym c32linker[] = {
+			{ (int32_t)(dvma + dend), 0x2001, "end", 0 },
+			{ (int32_t)jmptbl, 0x2001, "_jmptbl", 1 },
+			{ 0, 0x2004, "btext", 2 },
+			{ (int32_t)iname, 0x2004, "bname", 3 },
+			{ (int32_t)vec->len, 0x2004, "etext", 4 },
+		};
+		const StbSym *linker = opt_stb == 2 ? ucclinker : c32linker;
+		const size_t nlinker = opt_stb == 2 ? sizeof(ucclinker) / sizeof(ucclinker[0]) : sizeof(c32linker) / sizeof(c32linker[0]);
+		const char *const reserved[] = { "_bdata", "bdata", "_enddata", "end", "_jmptbl", "_btext", "btext", "_bname", "bname", "_etext", "etext", "_ejmptbl" };
+		stb_reverse = opt_stb == 1;
+		StbSym *ss = malloc((nsyms + nlinker) * sizeof(StbSym));
+		memcpy(ss, linker, nlinker * sizeof(StbSym));
+		size_t nss = nlinker;
+		for(long i = 0; i < nsyms; i++) {
+			asymbol *s = syms[i];
+			asection *sec = s->section;
+			uint16_t type;
+			if(!(s->flags & BSF_GLOBAL) || !strncmp(bfd_asymbol_name(s), "__os9_", 6)) continue;
+			size_t k, nres = sizeof(reserved) / sizeof(reserved[0]);
+			for(k = 0; k < nres && strcmp(bfd_asymbol_name(s), reserved[k]); k++);
+			if(k < nres) continue; // the linker's: as above, or not listed
+			if(sec == text) type = 4;
+			else if(sec == data) type = 1;
+			else if(sec == bss) type = 0;
+			else if(sec && (sec == rdata || sec == rbss)) type = 2;
+			else if(bfd_is_abs_section(sec)) type = 6;
+			else continue;
+			ss[nss].value = type == 4 ? (int32_t)(itext + bfd_asymbol_value(s) - tvma) : (int32_t)bfd_asymbol_value(s);
+			ss[nss].type = type | (opt_stb == 1 && refd[i] ? 0x2000 : 0);
+			ss[nss].name = bfd_asymbol_name(s);
+			ss[nss].rank = nlinker;
+			nss++;
+		}
+		qsort(ss, nss, sizeof(StbSym), cmp_stbsym);
+
+		Vec *sv = vec_new(0x1000);
+		vec_zero(sv, 0x30); // data module header
+		char *sname = malloc(strlen(opt_name) + 5);
+		sprintf(sname, "%s.stb", opt_name);
+		size_t isname = vec_append(sv, sname, strlen(sname) + 1);
+		while(sv->len % 2) vec_zero(sv, 1); // word fields must be at even offsets
+		size_t istb = vec_zero(sv, 2 + 4 + 4 + 4);
+		while(sv->len % 16) vec_zero(sv, 1);
+		size_t ient = vec_zero(sv, nss * 10);
+		unsigned char *h = (unsigned char*)sv->buf + istb;
+		h[0] = 0x01; h[1] = 0x00; // STB format 0x0100
+		h[2] = crc >> 24; h[3] = crc >> 16; h[4] = crc >> 8; h[5] = crc;
+		h[6] = ient >> 24; h[7] = ient >> 16; h[8] = ient >> 8; h[9] = ient;
+		h[10] = nss >> 24; h[11] = nss >> 16; h[12] = nss >> 8; h[13] = nss;
+		for(size_t i = 0; i < nss; i++) {
+			size_t iname = vec_append(sv, (void*)ss[i].name, strlen(ss[i].name) + 1);
+			unsigned char *e = (unsigned char*)sv->buf + ient + i * 10;
+			uint32_t v = ss[i].value;
+			e[0] = v >> 24; e[1] = v >> 16; e[2] = v >> 8; e[3] = v;
+			e[4] = ss[i].type >> 8; e[5] = ss[i].type;
+			e[6] = iname >> 24; e[7] = iname >> 16; e[8] = iname >> 8; e[9] = iname;
+		}
+		while(sv->len % 2) vec_zero(sv, 1);
+		size_t iscrc = vec_zero(sv, 4);
+
+		struct modheader *sh = (void*)(sv->buf + 0);
+		sh->symbol = BE32(istb);
+		sh->magic = BE16(0x4AFC);
+		sh->sysrev = BE16(0x0001);
+		sh->owner = BE32(owner);
+		sh->accs = BE16(0x0555);
+		sh->type = 4; // data
+		sh->lang = 0;
+		sh->attr = 0x80;
+		sh->revs = mh->revs;
+		sh->edit = mh->edit;
+		finish_module(sv, isname, iscrc);
+
+		// OUTFILE.stb, or in the STB directory next to OUTFILE if there's one
+		// (as l68).
+		char *sfile = malloc(strlen(argv[1]) + 9);
+		const char *base = strrchr(argv[1], '/');
+		base = base ? base + 1 : argv[1];
+		sprintf(sfile, "%.*sSTB", (int)(base - argv[1]), argv[1]);
+		struct stat st;
+		if(!stat(sfile, &st) && S_ISDIR(st.st_mode)) sprintf(sfile, "%.*sSTB/%s.stb", (int)(base - argv[1]), argv[1], base);
+		else sprintf(sfile, "%s.stb", argv[1]);
+		FILE *sf = fopen(sfile, "w+b");
+		if(!sf || !fwrite(sv->buf, sv->len, 1, sf)) {
+			perror("could not write symbol module");
+			return 1;
+		}
+		fclose(sf);
+	}
 
 	// write
 	FILE *fp = fopen(argv[1], "w+b");

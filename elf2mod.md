@@ -109,3 +109,44 @@ module), and each far reference is redirected through it, keeping its size:
   elf2mod reports them as errors.
 - `move.l` changes the condition codes where `pea` doesn't; that only matters for hand-written
   assembly that relies on them.
+
+## Symbol modules for the debugger (this fork)
+
+With `-g` (`--stb[=STYLE]`), elf2mod also writes a symbol module `OUTFILE.stb`, as Microware's linker
+does with `l68 -g`: an OS-9 data module named `MODNAME.stb` that lists the program's global
+symbols for the user-state debugger and SrcDbg. If there's a directory `STB` next to OUTFILE, the
+symbol module goes there instead, as with l68. The format is described in appendix A of the
+*OS-9/68000 User-State Debugger* manual:
+
+- the module header, with its symbol field pointing to the STB header; the name
+- the STB header: the format (0x0100), the program module's CRC (so the debugger can check that
+  the symbols belong to the program), the offset and number of the symbol entries
+- the symbol entries, by value: a 4-byte value, a 2-byte type (0 uninitialized data,
+  1 initialized data, 2 remote data, 4 code, 6 absolute) and the 4-byte offset of the name.
+  Code symbols are offsets in the module, data symbols a6-relative (their VMAs). Static
+  symbols, `__os9_*` and `_ejmptbl` aren't listed.
+- the symbols the linker defines, with type flag 0x2000: `btext` (0), `bname` (the module name),
+  `etext` (the module size), `end` (the end of the data area) and `_jmptbl`
+- the names, then the module CRC
+
+The two versions of l68 write this a little differently, and `--stb=STYLE` follows either:
+
+- `c32` (the default, as `-g`): Microware C 3.2's l68, as used for CD-i. The type flag 0x2000
+  also marks the symbols that other psects refer to; elf2mod sets it on the symbols that
+  relocations refer to. Symbols with the same value are listed in reverse order of definition
+  (here: by name, descending).
+- `ucc`: Ultra C's l68. It also defines `_btext`, `_bname`, `_etext`, `_bdata`/`bdata` (the start
+  of the data area) and `_enddata`, and doesn't flag referenced symbols. Symbols with the same
+  value are listed linker symbols first, then by name. Its symbol modules have the header parity
+  at offset 0x28 instead of 0x2E; elf2mod uses 0x2E, as for other modules (OS-9's check passes
+  either way).
+
+For the same input, the result matches l68's symbol module. The test `test/l68cmp` in
+[toolchaincdi](https://github.com/cdifan/toolchaincdi) checks this with both linkers: it links
+the same ROFs with l68 and with rof2elf, GNU ld and elf2mod. The program modules are then the
+same as well, apart from the order of the data relocation table and the CRCs.
+
+## Module owner (this fork)
+
+The module owner (group.user) is `--owner` (`-u`), otherwise the `GRPUSER` environment variable as
+with l68, otherwise 0.0. l68 uses 1.0 when `GRPUSER` isn't set.

@@ -201,6 +201,12 @@ get32 (In *in)
 	 | (in->p[-2] << 8) | in->p[-1];
 }
 
+static uint32_t
+getcount (In *in, int wide)
+{
+  return wide ? get32 (in) : get16 (in);
+}
+
 static char *
 getname (In *in)
 {
@@ -245,7 +251,8 @@ typedef struct
 static int
 parse_rof (In *in, Rof *r)
 {
-  int i, j, n;
+  int i, j, n, wide;
+  unsigned series;
 
   memset (r, 0, sizeof *r);
   if (get32 (in) != 0xDEADFACE)
@@ -254,7 +261,18 @@ parse_rof (In *in, Rof *r)
   r->attrev = get16 (in);
   if (get16 (in) != 0)
     die ("%s: ROF has assembly errors", in->file);
-  get16 (in);			/* series */
+  /* The series (ROF edition): 9, or 0xF9 for 9.1 (from Ultra C's r68),
+     whose counts of symbols and references are 32 bits instead of 16 (see
+     "Relocatable Object File Format" in Using Ultra C/C++).  9.2 adds
+     header fields and edition 15 is a different format.  */
+  series = get16 (in);
+  if (series != 9 && series != 0xF9)
+    {
+      char fmt[64];
+      sprintf (fmt, "%%s: unsupported ROF series 0x%04X", series);
+      die (fmt, in->file);
+    }
+  wide = series == 0xF9;
   need (in, 6);
   in->p += 6;			/* date */
   r->edition = get16 (in);
@@ -269,7 +287,7 @@ parse_rof (In *in, Rof *r)
   r->debug = get32 (in);
   r->name = getname (in);
 
-  r->ndefs = get16 (in);
+  r->ndefs = getcount (in, wide);
   r->defs = xmalloc (r->ndefs * sizeof (Def));
   for (i = 0; i < r->ndefs; i++)
     {
@@ -285,7 +303,7 @@ parse_rof (In *in, Rof *r)
   in->p = r->rdatap + r->ridata + r->debug;
 
   /* External references: a name and a list of places.  */
-  r->nexts = get16 (in);
+  r->nexts = getcount (in, wide);
   r->exts = xmalloc (r->nexts * sizeof (char *));
   r->nrefs = 0;
   {
@@ -293,12 +311,12 @@ parse_rof (In *in, Rof *r)
     for (i = 0; i < r->nexts; i++)
       {
 	free (getname (in));
-	n = get16 (in);
+	n = getcount (in, wide);
 	need (in, n * 6);
 	in->p += n * 6;
 	r->nrefs += n;
       }
-    n = get16 (in);		/* local references */
+    n = getcount (in, wide);	/* local references */
     r->nrefs += n;
     in->p = save;
   }
@@ -306,14 +324,14 @@ parse_rof (In *in, Rof *r)
   for (i = 0, j = 0; i < r->nexts; i++)
     {
       r->exts[i] = getname (in);
-      for (n = get16 (in); n > 0; n--, j++)
+      for (n = getcount (in, wide); n > 0; n--, j++)
 	{
 	  r->refs[j].type = get16 (in);
 	  r->refs[j].offset = get32 (in);
 	  r->refs[j].ext = i;
 	}
     }
-  for (n = get16 (in); n > 0; n--, j++)
+  for (n = getcount (in, wide); n > 0; n--, j++)
     {
       r->refs[j].type = get16 (in);
       r->refs[j].offset = get32 (in);
