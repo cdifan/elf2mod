@@ -87,7 +87,8 @@ In [toolchaincdi](https://github.com/cdifan/toolchaincdi):
   originals, byte for byte.
 - `make check-l68` in `test/abi-exec`: the Level 2 calling convention tests, compiled by GCC,
   converted by elf2rof (with libgcc), linked by `l68` and run as OS-9 modules in an emulator,
-  including far calls through `l68`'s jump table.
+  including far calls through `l68`'s jump table; and GCC code linked by `l68` with Microware's
+  original C library.
 
 The ROF format is described in the *OS-9 Assembler/Linker User Manual*, chapter 3, and in *Using
 Ultra C/C++*, chapter 6. Section 6 of
