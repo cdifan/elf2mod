@@ -56,7 +56,9 @@ For example:
 ```
 SECTIONS {
     . = 0x400000;
-    .text : { *(.text .text.*) *(.rodata .rodata.*) . = ALIGN(2); }
+    /* .rodata in the same statement: each object's constants follow its code,
+       within PC-relative reach also in programs over 32K */
+    .text : { *(.text .text.* .rodata .rodata.*) . = ALIGN(2); }
     . = -0x8000;
     .bss (NOLOAD) : { *(.bss .bss.*) *(COMMON) . = ALIGN(2); }
     .data : { *(.data .data.*) . = ALIGN(2); }
