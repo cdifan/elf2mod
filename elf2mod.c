@@ -333,14 +333,14 @@ int main(int argc, char *argv[]) {
 	if(!opt_name) {
 		opt_name = strdup(argv[0]);
 		{
-			char *p = strrchr(opt_name, '.');
-			if(p) { *p = '\0'; }
-		}
-		{
 			char *p = strrchr(opt_name, '/');
 			if(p) {
 				memmove(opt_name, p + 1, strlen(p + 1) + 1);
 			}
+		}
+		{
+			char *p = strrchr(opt_name, '.'); // after the directory (this fork)
+			if(p) { *p = '\0'; }
 		}
 		// XXX: isn't there something like strlower()??
 		for(char *p = opt_name; *p; p++) {
@@ -459,11 +459,32 @@ int main(int argc, char *argv[]) {
 		arelent *rel = trels[i];
 		asection *ssec = rel->sym_ptr_ptr[0]->section;
 		if(rel->sym_ptr_ptr >= syms && rel->sym_ptr_ptr < syms + nsyms) refd[rel->sym_ptr_ptr - syms] = 1;
+		if(bfd_is_und_section(ssec)) {
+			printf("undefined symbol %s (.text+%08lx)\n", rel->sym_ptr_ptr[0]->name, rel->address);
+			return 1;
+		}
 		int constant = bfd_is_abs_section(ssec) || ssec == data || ssec == bss || (ssec && (ssec == rdata || ssec == rbss));
 		if(!(ssec == text || rel->howto->type == 2 /* R_68K_16(%a6) */
 		     || ((rel->howto->type == 1 /* R_68K_32 */ || rel->howto->type == 3 /* R_68K_8 */) && constant))) {
 			printf(".text inter-section relocation not allowed: %s %08lx %s@%s+%08lx\n", rel->howto->name, rel->address, rel->sym_ptr_ptr[0]->name, rel->sym_ptr_ptr[0]->section->name, rel->addend);
 			return 1;
+		}
+		// The value must fit its field: a6-relative 16 bits (more than 64K
+		// of a6 data), 8 bits, and short branches (bra.s).  ld only warns
+		// about some of these with --noinhibit-exec, and not at all about
+		// R_68K_16.  Far PC16 references are handled by the jump table.
+		{
+			int64_t v = (int64_t)(int32_t)(bfd_asymbol_value(rel->sym_ptr_ptr[0]) + rel->addend);
+			int bad = 0;
+			switch(rel->howto->type) {
+			case 2: /* R_68K_16 */ bad = v < -0x8000 || v > 0xFFFF || (ssec != text && !bfd_is_abs_section(ssec) && v > 0x7FFF); break;
+			case 3: /* R_68K_8 */ bad = v < -0x80 || v > 0xFF; break;
+			case 6: /* R_68K_PC8 */ v -= (int64_t)(int32_t)(tvma + rel->address); bad = v < -0x80 || v > 0x7F; break;
+			}
+			if(bad) {
+				printf("%s at .text+%08lx doesn't fit: %s%+ld = %lld\n", rel->howto->name, rel->address, rel->sym_ptr_ptr[0]->name, (long)rel->addend, (long long)v);
+				return 1;
+			}
 		}
 	}
 
@@ -485,8 +506,24 @@ int main(int argc, char *argv[]) {
 				return 1;
 			}
 			if(rel->sym_ptr_ptr >= syms && rel->sym_ptr_ptr < syms + nsyms) refd[rel->sym_ptr_ptr - syms] = 1;
+			// What the pointer points to: code or data, relocated when OS-9
+			// loads the module; an absolute value (an equate) or an undefined
+			// weak symbol (0, as ld resolved it) stays as it is.
+			asymbol *s = rel->sym_ptr_ptr[0];
+			asection *ssec = s->section;
+			if(bfd_is_abs_section(ssec) || (bfd_is_und_section(ssec) && (s->flags & BSF_WEAK))) {
+				continue;
+			}
+			if(bfd_is_und_section(ssec)) {
+				printf("undefined symbol %s (%s+%08lx)\n", s->name, sec->name, rel->address);
+				return 1;
+			}
+			if(!(ssec == text || ssec == data || ssec == bss || (ssec && (ssec == rdata || ssec == rbss)))) {
+				printf("%s pointer to an unexpected section: %s@%s\n", sec->name, s->name, ssec->name);
+				return 1;
+			}
 			drefs[ndrefs].addr = DOFF(bfd_section_vma(sec)) + rel->address;
-			drefs[ndrefs].text = rel->sym_ptr_ptr[0]->section == text;
+			drefs[ndrefs].text = ssec == text;
 			ndrefs++;
 		}
 	}
@@ -535,11 +572,11 @@ int main(int argc, char *argv[]) {
 	// -0x8000 with A6 0x8000 into it.
 	{
 		bfd_vma jt = 0, ejt = 0;
-		int have_jt = 0;
+		int have_jt = 0, have_ejt = 0;
 		for(long i = 0; i < nsyms; i++) {
 			const char *n = bfd_asymbol_name(syms[i]);
 			if(!strcmp(n, "_jmptbl")) { jt = bfd_asymbol_value(syms[i]); have_jt = 1; }
-			else if(!strcmp(n, "_ejmptbl")) ejt = bfd_asymbol_value(syms[i]);
+			else if(!strcmp(n, "_ejmptbl")) { ejt = bfd_asymbol_value(syms[i]); have_ejt = 1; }
 		}
 		bfd_vma *targets = NULL;
 		size_t ntargets = 0, nfar = 0;
@@ -562,6 +599,13 @@ int main(int argc, char *argv[]) {
 			uint16_t op = (ins[0] << 8) | ins[1];
 			uint16_t newop;
 			int extra;
+			if(rel->address >= 4) {
+				uint16_t prev = (ins[-2] << 8) | ins[-1];
+				if((prev & 0xFFBF) == 0x4CBA || (prev & 0xFF3F) == 0x083A) {
+					printf("far PC-relative reference at .text+%08lx (instruction %04x %04x) can't be patched: target %s\n", rel->address, prev, op, rel->sym_ptr_ptr[0]->name);
+					return 1;
+				}
+			}
 			if(op == 0x6100) { newop = 0x4EAE; extra = 0; }		// bsr.w -> jsr d(a6)
 			else if(op == 0x6000) { newop = 0x4EEE; extra = 0; }		// bra.w -> jmp d(a6)
 			else if((op & 0xF1FF) == 0x41FA) { newop = 0x206E | (op & 0x0E00); extra = 2; }	// lea d(pc),An -> movea.l d(a6),An
@@ -587,8 +631,8 @@ int main(int argc, char *argv[]) {
 			ins[2] = (uint16_t)d >> 8; ins[3] = (uint16_t)d;
 		}
 		if(ntargets) {
-			size_t cap = (size_t)(int32_t)(ejt - jt) / 6;
-			if(!have_jt || ntargets > cap) {
+			size_t cap = have_jt && have_ejt && (int32_t)(ejt - jt) >= 0 ? (size_t)(int32_t)(ejt - jt) / 6 : 0;
+			if(!have_jt || !have_ejt || ntargets > cap) {
 				printf("%zu far calls need a jump table of %zu entries (%zu bytes): reserve _jmptbl to _ejmptbl in .data (now %zu entries)\n", nfar, ntargets, ntargets * 6, have_jt ? cap : 0);
 				return 1;
 			}

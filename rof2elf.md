@@ -17,7 +17,9 @@ rof2elf -l INPUT
   member per ROF. Run `ranlib` on it before linking.
 - `-e EQUFILE` takes `equ` definitions from another ROF or library, usually `sys.l`, and folds
   references to them into the code. This is needed when code adds several equates in one place
-  (e.g. `Dir_+Write_` in a mode byte), which an ELF relocation can't express.
+  (e.g. `Dir_+Write_` in a mode byte), which an ELF relocation can't express. An equate
+  defined with different values (Microware C 3.2's and Ultra C's `sys.l` differ, e.g. `DEVSIZ`)
+  is reported, and the first definition wins; a folded value must fit its field.
 - `-l` lists the ROFs in `INPUT`.
 
 For example, with Microware's C library (from your own installation; Microware's files are not
@@ -56,7 +58,8 @@ define the symbols Microware's linker provides, such as `end`.
 - Other combinations of references at one place are rejected, unless only equates are involved.
 - A mainline ROF (one with a module type, like `cstart.r`) also gets absolute symbols holding its
   module header values: `__os9_tylan`, `__os9_attrev`, `__os9_edition` and `__os9_stack`, and code
-  symbols `__os9_entry` and `__os9_trapent`, which elf2mod uses for the module header.
+  symbols `__os9_entry` and `__os9_trapent` (only when the ROF has a trap entry, not
+  0xFFFFFFFF), which elf2mod uses for the module header.
 
 The ROF format is described in the *OS-9 Assembler/Linker User Manual*, chapter 3, "Relocatable
 Object File Format", and in *Using Ultra C/C++*, chapter 6. rof2elf reads ROF edition 9, from

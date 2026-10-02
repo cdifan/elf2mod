@@ -7,8 +7,8 @@ A utility that converts a specially-crafted m68k ELF object into a OS-9/68000 ex
 - Prepare a specially-crafted ELF file
   - See next section for details
 - Run elf2mod, like `elf2mod some.elf CDI_SOME.APP`
-  - In default, module name become basename without extension of output file, in lower case.
-  - In above example, it become `cdi_some`
+  - In default, module name become basename without extension of ELF file, in lower case.
+  - In above example, it become `some`
 - Profit!
 
 You can `elf2mod --help` to get descriptions of options.
@@ -34,6 +34,11 @@ You need to have OS-9/68000 executable knowledge...
   - In other words, -0x8000 bias must be done at ELF file.
   - It starts with `.data` or `.bss`, whichever comes first.
 - `.data` must *NOT* contains relocations *except* 32bit direct relocations i.e. `R_68K_32`
+  - To code or data: relocated when OS-9 loads the module. To absolute symbols (equates) or
+    undefined weak symbols (0): kept as they are. Undefined symbols are errors. (This fork.)
+- Values in `.text` must fit their fields: a6-relative `R_68K_16` (-0x8000 to 0x7FFF for data),
+  `R_68K_8`, and `R_68K_PC8` (short branches). GNU ld doesn't check all of these, and only warns
+  with `--noinhibit-exec`; elf2mod reports them. (This fork.)
 - `.bss` must be contiguous with `.data` (usually it is.)
 - `.bss` must not have CONTENTS (usually it is.)
 - Relocation values must be applied but relocation itself must be left

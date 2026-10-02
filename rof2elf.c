@@ -52,6 +52,7 @@
  */
 
 #include <ctype.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -180,7 +181,7 @@ typedef struct
 static void
 need (In *in, size_t n)
 {
-  if ((size_t) (in->end - in->p) < n)
+  if (in->p > in->end || (size_t) (in->end - in->p) < n)
     die ("%s: truncated ROF", in->file);
 }
 
@@ -205,6 +206,17 @@ static uint32_t
 getcount (In *in, int wide)
 {
   return wide ? get32 (in) : get16 (in);
+}
+
+/* A count of items of at least MINSIZE bytes each: no more than the
+   rest of the input can hold.  */
+static uint32_t
+getcount_of (In *in, int wide, size_t minsize)
+{
+  uint32_t n = getcount (in, wide);
+  if (in->p > in->end || n > (size_t) (in->end - in->p) / minsize)
+    die ("%s: bad count in ROF", in->file);
+  return n;
 }
 
 static char *
@@ -287,7 +299,7 @@ parse_rof (In *in, Rof *r)
   r->debug = get32 (in);
   r->name = getname (in);
 
-  r->ndefs = getcount (in, wide);
+  r->ndefs = getcount_of (in, wide, 7);	/* name, type, value */
   r->defs = xmalloc (r->ndefs * sizeof (Def));
   for (i = 0; i < r->ndefs; i++)
     {
@@ -296,14 +308,16 @@ parse_rof (In *in, Rof *r)
       r->defs[i].value = get32 (in);
     }
 
-  need (in, r->code + r->idata + r->ridata + r->debug);
+  if ((uint64_t) r->code + r->idata + r->ridata + r->debug
+      > (uint64_t) (in->end - in->p))
+    die ("%s: truncated ROF", in->file);
   r->codep = in->p;
   r->datap = r->codep + r->code;
   r->rdatap = r->datap + r->idata;
   in->p = r->rdatap + r->ridata + r->debug;
 
   /* External references: a name and a list of places.  */
-  r->nexts = getcount (in, wide);
+  r->nexts = getcount_of (in, wide, 3);	/* name, count */
   r->exts = xmalloc (r->nexts * sizeof (char *));
   r->nrefs = 0;
   {
@@ -311,12 +325,15 @@ parse_rof (In *in, Rof *r)
     for (i = 0; i < r->nexts; i++)
       {
 	free (getname (in));
-	n = getcount (in, wide);
-	need (in, n * 6);
-	in->p += n * 6;
+	n = getcount_of (in, wide, 6);
+	in->p += (size_t) n * 6;
+	if (r->nrefs > INT_MAX - n)
+	  die ("%s: too many references in ROF", in->file);
 	r->nrefs += n;
       }
-    n = getcount (in, wide);	/* local references */
+    n = getcount_of (in, wide, 6);	/* local references */
+    if (r->nrefs > INT_MAX - n)
+      die ("%s: too many references in ROF", in->file);
     r->nrefs += n;
     in->p = save;
   }
@@ -446,6 +463,7 @@ typedef struct
 {
   char *name;
   uint32_t value;
+  int order;			/* the first definition wins */
 } Equ;
 
 static Equ *equs;
@@ -454,7 +472,9 @@ static int nequs, equs_sorted;
 static int
 cmp_equ (const void *a, const void *b)
 {
-  return strcmp (((const Equ *) a)->name, ((const Equ *) b)->name);
+  const Equ *x = a, *y = b;
+  int c = strcmp (x->name, y->name);
+  return c ? c : x->order - y->order;
 }
 
 static void
@@ -467,9 +487,17 @@ add_equates (Rof *r)
 	equs = realloc (equs, (nequs + 1) * sizeof (Equ));
 	equs[nequs].name = r->defs[i].name;
 	equs[nequs].value = r->defs[i].value;
+	equs[nequs].order = nequs;
 	nequs++;
       }
   equs_sorted = 0;
+}
+
+/* For lookups, once the equates are sorted and unique.  */
+static int
+cmp_equ_name (const void *a, const void *b)
+{
+  return strcmp (((const Equ *) a)->name, ((const Equ *) b)->name);
 }
 
 static Equ *
@@ -478,11 +506,24 @@ find_equate (const char *name)
   Equ key;
   if (!equs_sorted)
     {
+      int i, n = 0;
       qsort (equs, nequs, sizeof (Equ), cmp_equ);
+      for (i = 0; i < nequs; i++)
+	if (n > 0 && !strcmp (equs[n - 1].name, equs[i].name))
+	  {
+	    if (equs[n - 1].value != equs[i].value)
+	      fprintf (stderr, "%s: warning: equate %s defined as 0x%x and 0x%x; "
+		       "using 0x%x\n", progname, equs[i].name,
+		       (unsigned) equs[n - 1].value, (unsigned) equs[i].value,
+		       (unsigned) equs[n - 1].value);
+	  }
+	else
+	  equs[n++] = equs[i];
+      nequs = n;
       equs_sorted = 1;
     }
   key.name = (char *) name;
-  return nequs ? bsearch (&key, equs, nequs, sizeof (Equ), cmp_equ) : NULL;
+  return nequs ? bsearch (&key, equs, nequs, sizeof (Equ), cmp_equ_name) : NULL;
 }
 
 /* Convert one ROF to an ELF relocatable in OUT.  */
@@ -542,8 +583,9 @@ rof_to_elf (const char *file, Rof *r, Buf *out)
 	       SHN_ABS);
       add_sym (&e, "__os9_entry", r->entry, 0, INFO (STB_GLOBAL, STT_FUNC),
 	       S_TEXT);
-      add_sym (&e, "__os9_trapent", r->trapent, 0,
-	       INFO (STB_GLOBAL, STT_FUNC), S_TEXT);
+      if (r->trapent != 0xFFFFFFFF)	/* none */
+	add_sym (&e, "__os9_trapent", r->trapent, 0,
+		 INFO (STB_GLOBAL, STT_FUNC), S_TEXT);
     }
 
   /* Undefined symbols for the external references.  */
@@ -609,7 +651,17 @@ rof_to_elf (const char *file, Rof *r, Buf *out)
 	}
       if (!pos && !neg)
 	{
-	  /* Only equates: the value is final.  */
+	  /* Only equates: the value is final, and must fit.  */
+	  if ((size == 1 && (addend < -0x80 || addend > 0xFF))
+	      || (size == 2 && (addend < -0x8000 || addend > 0xFFFF)))
+	    {
+	      fprintf (stderr, "%s: %s: equates at %s+0x%x add up to 0x%x, which "
+		       "doesn't fit in %d byte%s\n", progname, file,
+		       sec >= 0 ? secnames[sec] : ".debug", (unsigned) off,
+		       (unsigned) addend, size,
+		       size > 1 ? "s" : "");
+	      exit (1);
+	    }
 	  for (n = size - 1; n >= 0; n--, addend >>= 8)
 	    p[n] = addend;
 	  continue;

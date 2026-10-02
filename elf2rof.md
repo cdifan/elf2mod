@@ -15,8 +15,7 @@ elf2rof [-k] [-n NAME] [-o OUTPUT] INPUT
   (`main`), or `NAME` with `-n`.
 - An `ar` archive becomes a library of concatenated ROFs (`libgcc.a` → `libgcc.l`), one psect
   per member, named after it.
-- `-k` skips archive members that can't be converted, with a warning, instead of stopping. For
-  example, libgcc's soft-float members use GOT relocations.
+- `-k` skips archive members that can't be converted, with a warning, instead of stopping.
 
 For example, GCC code linked with Microware's `cstart.r` and C library (from your own
 installation; Microware's files are not included here):
@@ -24,7 +23,7 @@ installation; Microware's files are not included here):
 ```
 m68k-elfos9-gcc -c -mpcrel -ma6rel -mos9call -mbuiltin=os9call main.c
 elf2rof main.o
-elf2rof -k -o libgcc.l $(m68k-elfos9-gcc -print-libgcc-file-name)
+elf2rof -o libgcc.l $(m68k-elfos9-gcc -print-libgcc-file-name)
 l68 -o=prog cstart.r main.r -l=clib.l -l=libgcc.l -l=sys.l
 ```
 
@@ -40,7 +39,8 @@ Ultra C both read.
 |---|---|
 | read-only sections (`.text`, `.rodata`, ...) | code |
 | writable sections (`.data`, ...) | initialized data |
-| `.bss`, common symbols | uninitialized data |
+| `.bss` | uninitialized data |
+| common symbols | common definitions (type 0x0100, the size as value), referred to by name, which `l68` merges |
 | `.remote.data` / `.remote.bss` | remote initialized / uninitialized data |
 | global symbols | definitions (code, data, remote data; absolute symbols as `equ`) |
 | relocations to undefined symbols | external references |

@@ -64,6 +64,7 @@
 #define T_RDATA		0x0003
 #define T_CODE		0x0004
 #define T_EQU		0x0006
+#define T_COMMON	0x0100
 #define R_BYTE		0x0008
 #define R_WORD		0x0010
 #define R_LONG		0x0018
@@ -456,15 +457,10 @@ elf_to_rof (Obj *o, const char *name, Buf *out)
 	    y->type = e[12] & 0xF;
 	    y->shndx = get16 (e + 14);
 	    y->area = A_NONE;
-	    if (y->shndx == SHN_COMMON)
-	      {
-		uint32_t align = y->value > 1 ? y->value : 1;
-		asize[A_BSS] = (asize[A_BSS] + align - 1) & ~(align - 1);
-		y->area = A_BSS;
-		y->offset = asize[A_BSS];
-		asize[A_BSS] += y->size;
-	      }
-	    else if (y->shndx != SHN_UNDEF && y->shndx != SHN_ABS
+	    /* Common symbols (SHN_COMMON) become ROF common definitions,
+	       which l68 merges across psects; they stay out of the areas,
+	       and references to them are by name.  */
+	    if (y->shndx != SHN_UNDEF && y->shndx != SHN_ABS
 		     && y->shndx < nsecs && secs[y->shndx].area != A_NONE)
 	      {
 		y->area = secs[y->shndx].area;
@@ -538,7 +534,7 @@ elf_to_rof (Obj *o, const char *name, Buf *out)
 	  y = symi ? &syms[symi] : NULL;
 	  r.offset = lo;
 
-	  if (y && y->shndx == SHN_UNDEF)
+	  if (y && (y->shndx == SHN_UNDEF || y->shndx == SHN_COMMON))
 	    {
 	      /* An external reference; the addend goes into the bytes.  */
 	      int k;
@@ -645,6 +641,11 @@ elf_to_rof (Obj *o, const char *name, Buf *out)
 	{
 	  kind = T_EQU;
 	  value = y->value;
+	}
+      else if (y->shndx == SHN_COMMON)
+	{
+	  kind = T_COMMON | T_BSS;	/* the value is the size */
+	  value = y->size;
 	}
       else if (y->area != A_NONE)
 	{
