@@ -297,13 +297,19 @@ int main(int argc, char *argv[]) {
 	asymbol **syms = malloc(symsz);
 	/*long nsyms =*/ bfd_canonicalize_symtab(abfd, syms);
 
-	// .text relocs: no relocations to .data/.bss allowed
+	// .text relocs: no relocations to .data/.bss allowed, except
+	// R_68K_16 (a6-relative), and R_68K_32/R_68K_8 to .data/.bss or
+	// absolute symbols: their values are link-time constants (a6-relative
+	// data offsets, equates), as in code converted from ROF by rof2elf.
 	long trelsz = bfd_get_reloc_upper_bound(abfd, text);
 	arelent **trels = malloc(trelsz);
 	long ntrels = bfd_canonicalize_reloc(abfd, text, trels, syms);
 	for(long i = 0; i < ntrels; i++) {
 		arelent *rel = trels[i];
-		if(!(rel->sym_ptr_ptr[0]->section == text || rel->howto->type == 2 /* R_68K_16(%a6) */)) {
+		asection *ssec = rel->sym_ptr_ptr[0]->section;
+		int constant = bfd_is_abs_section(ssec) || ssec == data || ssec == bss;
+		if(!(ssec == text || rel->howto->type == 2 /* R_68K_16(%a6) */
+		     || ((rel->howto->type == 1 /* R_68K_32 */ || rel->howto->type == 3 /* R_68K_8 */) && constant))) {
 			printf(".text inter-section relocation not allowed: %s %08lx %s@%s+%08lx\n", rel->howto->name, rel->address, rel->sym_ptr_ptr[0]->name, rel->sym_ptr_ptr[0]->section->name, rel->addend);
 			return 1;
 		}

@@ -23,6 +23,7 @@
 BFDPATH=/usr/x86_64-pc-linux-gnu/m68k-elfos9
 DESTDIR=/usr
 EXE=elf2mod
+EXE_ROF2ELF=rof2elf
 
 CC=gcc
 CFLAGS=-g -I$(BFDPATH)/include -Wall -Wextra
@@ -33,13 +34,18 @@ RM=rm
 
 .PHONY: all clean
 
-all: $(EXE)
+all: $(EXE) $(EXE_ROF2ELF)
 
-install: $(EXE)
+install: $(EXE) $(EXE_ROF2ELF)
 	$(INSTALL) -s $(EXE) $(DESTDIR)/bin/$(EXE)
+	$(INSTALL) -s $(EXE_ROF2ELF) $(DESTDIR)/bin/$(EXE_ROF2ELF)
 
 clean:
-	-$(RM) $(EXE)
+	-$(RM) $(EXE) $(EXE_ROF2ELF)
 
 $(EXE): elf2mod.c
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LIBS)
+
+# rof2elf needs no BFD.
+$(EXE_ROF2ELF): rof2elf.c
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
