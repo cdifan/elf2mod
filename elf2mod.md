@@ -74,3 +74,38 @@ with its module header values. elf2mod uses them where present: type and languag
 (`__os9_stack`), entry point (`__os9_entry`) and uninitialized trap entry (`__os9_trapent`).
 The `--stack`, `--revs` and `--edit` options override them. Without them, the defaults are as
 before: program module, object code, reentrant, revision 1, edition 0, stack 0xC00.
+
+## Far calls: the jump table (this fork)
+
+Calls and address loads are PC-relative with 16-bit displacements, so they reach +-32K. For
+larger programs, elf2mod builds a jump table, as Microware's linker does: each target that's too
+far gets an entry `jmp target` in `_jmptbl`, in the data area (relocated when OS-9 loads the
+module), and each far reference is redirected through it, keeping its size:
+
+| Instruction | Becomes |
+|---|---|
+| `bsr.w f` | `jsr _jmptbl+x(a6)` |
+| `bra.w f` | `jmp _jmptbl+x(a6)` |
+| `lea f(pc),An` | `movea.l _jmptbl+x+2(a6),An` (the real address of `f`) |
+| `pea f(pc)` | `move.l _jmptbl+x+2(a6),-(sp)` |
+
+- Link with `--noinhibit-exec` as well as `-q`: ld then reports "relocation truncated to fit"
+  for the far references, but still writes the output, which elf2mod fixes.
+- The linker script reserves the table at the end of `.data`, from `_jmptbl` to `_ejmptbl`, 6
+  bytes per entry; elf2mod reports how many entries it needs if there aren't enough. For example,
+  with the size given on the command line (`--defsym __jmptbl_size=600`):
+
+```
+    .data : {
+        *(.data .data.*)
+        . = ALIGN(2);
+        _jmptbl = .;
+        . += DEFINED(__jmptbl_size) ? __jmptbl_size : 0;
+        _ejmptbl = .;
+    }
+```
+
+- Conditional branches (`Bcc`, `DBcc`) and other far PC-relative references can't be redirected;
+  elf2mod reports them as errors.
+- `move.l` changes the condition codes where `pea` doesn't; that only matters for hand-written
+  assembly that relies on them.

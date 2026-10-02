@@ -431,6 +431,98 @@ int main(int argc, char *argv[]) {
 		return 1;
 	}
 
+	// Jump table (this fork): a PC-relative call or address load whose
+	// target is beyond +-32K (ld --noinhibit-exec left the value
+	// truncated) goes through an entry of _jmptbl, which the linker script
+	// reserves in .data, up to _ejmptbl: "jmp target" ($4EF9 and a 32-bit
+	// address, relocated at load time). The instruction keeps its size:
+	//   bsr.w f       -> jsr _jmptbl+x(a6)
+	//   bra.w f       -> jmp _jmptbl+x(a6)
+	//   lea f(pc),An  -> movea.l _jmptbl+x+2(a6),An   (the address of f)
+	//   pea f(pc)     -> move.l _jmptbl+x+2(a6),-(sp)
+	// a6-relative displacements equal VMAs, since the data area starts at
+	// -0x8000 with A6 0x8000 into it.
+	{
+		bfd_vma jt = 0, ejt = 0;
+		int have_jt = 0;
+		for(long i = 0; i < nsyms; i++) {
+			const char *n = bfd_asymbol_name(syms[i]);
+			if(!strcmp(n, "_jmptbl")) { jt = bfd_asymbol_value(syms[i]); have_jt = 1; }
+			else if(!strcmp(n, "_ejmptbl")) ejt = bfd_asymbol_value(syms[i]);
+		}
+		bfd_vma *targets = NULL;
+		size_t ntargets = 0, nfar = 0;
+		for(long i = 0; i < ntrels; i++) {
+			arelent *rel = trels[i];
+			if(rel->howto->type != 5 /* R_68K_PC16 */ && rel->howto->type != 14 /* R_68K_PLT16 */) {
+				continue;
+			}
+			bfd_vma target = bfd_asymbol_value(rel->sym_ptr_ptr[0]) + rel->addend;
+			int32_t disp = (int32_t)(target - (tvma + rel->address));
+			if(-0x8000 <= disp && disp <= 0x7FFF) {
+				continue;
+			}
+			nfar++;
+			if(rel->address < 2) {
+				printf("far PC-relative reference at .text+%08lx can't be patched\n", rel->address);
+				return 1;
+			}
+			unsigned char *ins = (unsigned char*)vec->buf + itext + rel->address - 2;
+			uint16_t op = (ins[0] << 8) | ins[1];
+			uint16_t newop;
+			int extra;
+			if(op == 0x6100) { newop = 0x4EAE; extra = 0; }		// bsr.w -> jsr d(a6)
+			else if(op == 0x6000) { newop = 0x4EEE; extra = 0; }		// bra.w -> jmp d(a6)
+			else if((op & 0xF1FF) == 0x41FA) { newop = 0x206E | (op & 0x0E00); extra = 2; }	// lea d(pc),An -> movea.l d(a6),An
+			else if(op == 0x487A) { newop = 0x2F2E; extra = 2; }		// pea d(pc) -> move.l d(a6),-(sp)
+			else {
+				printf("far PC-relative reference at .text+%08lx (instruction %04x) can't be patched: target %s\n", rel->address, op, rel->sym_ptr_ptr[0]->name);
+				return 1;
+			}
+			size_t k;
+			for(k = 0; k < ntargets && targets[k] != target; k++)
+				;
+			if(k == ntargets) {
+				targets = realloc(targets, (ntargets + 1) * sizeof(bfd_vma));
+				targets[ntargets++] = target;
+			}
+			bfd_vma evma = jt + 6 * k;
+			int32_t d = (int32_t)(evma + extra);
+			if(d < -0x8000 || 0x7FFF < d) {
+				printf("_jmptbl entry %zu is out of a6's reach\n", k);
+				return 1;
+			}
+			ins[0] = newop >> 8; ins[1] = newop;
+			ins[2] = (uint16_t)d >> 8; ins[3] = (uint16_t)d;
+		}
+		if(ntargets) {
+			size_t cap = (size_t)(int32_t)(ejt - jt) / 6;
+			if(!have_jt || ntargets > cap) {
+				printf("%zu far calls need a jump table of %zu entries (%zu bytes): reserve _jmptbl to _ejmptbl in .data (now %zu entries)\n", nfar, ntargets, ntargets * 6, have_jt ? cap : 0);
+				return 1;
+			}
+			// the entries, with their addresses relocated like pointers
+			drefs = realloc(drefs, (ndrefs + ntargets) * sizeof(IdRef));
+			for(size_t k = 0; k < ntargets; k++) {
+				uint32_t eoff = DOFF(jt + 6 * k);
+				unsigned char *e = (unsigned char*)vec->buf + iidata + eoff - idstart;
+				if(eoff < idstart || eoff + 6 > idend) {
+					puts("_jmptbl must be inside .data");
+					return 1;
+				}
+				e[0] = 0x4E; e[1] = 0xF9;
+				uint32_t t = targets[k];
+				e[2] = t >> 24; e[3] = t >> 16; e[4] = t >> 8; e[5] = t;
+				drefs[ndrefs].addr = eoff + 2;
+				drefs[ndrefs].text = 1;
+				ndrefs++;
+			}
+			qsort(drefs, ndrefs, sizeof(IdRef), cmp_idref);
+			printf("_jmptbl: %zu of %zu entries used, for %zu far references\n", ntargets, cap, nfar);
+		}
+		free(targets);
+	}
+
 	// fix pointer in .data to 0-based
 	for(size_t i = 0; i < ndrefs; i++) {
 		uint32_t *p = (void*)(vec->buf + iidata + drefs[i].addr - idstart);
