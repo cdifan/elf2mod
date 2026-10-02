@@ -122,7 +122,8 @@ symbol module goes there instead, as with l68. The format is described in append
 - the STB header: the format (0x0100), the program module's CRC (so the debugger can check that
   the symbols belong to the program), the offset and number of the symbol entries
 - the symbol entries, by value: a 4-byte value, a 2-byte type (0 uninitialized data,
-  1 initialized data, 2 remote data, 4 code, 6 absolute) and the 4-byte offset of the name.
+  1 initialized data, 2 uninitialized remote data, 3 initialized remote data, 4 code, 6
+  absolute) and the 4-byte offset of the name.
   Code symbols are offsets in the module, data symbols a6-relative (their VMAs). Static
   symbols, `__os9_*` and `_ejmptbl` aren't listed.
 - the symbols the linker defines, with type flag 0x2000: `btext` (0), `bname` (the module name),

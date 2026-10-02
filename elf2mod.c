@@ -715,7 +715,8 @@ int main(int argc, char *argv[]) {
 			if(sec == text) type = 4;
 			else if(sec == data) type = 1;
 			else if(sec == bss) type = 0;
-			else if(sec && (sec == rdata || sec == rbss)) type = 2;
+			else if(sec && sec == rdata) type = 3; // initialized remote, as l68
+			else if(sec && sec == rbss) type = 2;
 			else if(bfd_is_abs_section(sec)) type = 6;
 			else continue;
 			ss[nss].value = type == 4 ? (int32_t)(itext + bfd_asymbol_value(s) - tvma) : (int32_t)bfd_asymbol_value(s);
