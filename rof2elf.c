@@ -34,7 +34,7 @@
  *   code                    -> .text
  *   initialized data        -> .data         (a6-relative; the linker script
  *   uninitialized data      -> .bss           places data at -0x8000)
- *   remote init/uninit data -> .data.remote / .bss.remote
+ *   remote init/uninit data -> .remote.data / .remote.bss
  *   debug information       -> dropped
  *   equ definitions         -> absolute symbols
  *   common definitions      -> ELF common symbols
@@ -334,8 +334,8 @@ enum
 };
 
 static const char *const secnames[S_NUM] = {
-  "", ".text", ".data", ".bss", ".data.remote", ".bss.remote",
-  ".rela.text", ".rela.data", ".rela.data.remote", ".symtab", ".strtab",
+  "", ".text", ".data", ".bss", ".remote.data", ".remote.bss",
+  ".rela.text", ".rela.data", ".rela.remote.data", ".symtab", ".strtab",
   ".shstrtab"
 };
 

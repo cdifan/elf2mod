@@ -67,9 +67,14 @@ struct modheader {
 #endif
 
 char *opt_name;
-int opt_stack = 0x00000C00;
-int opt_revs = 1;
-int opt_edit = 0;
+// -1: not given; then the value of __os9_stack etc. (from a mainline ROF
+// converted by rof2elf, such as cstart.r), or the default.
+int opt_stack = -1;
+int opt_revs = -1;
+int opt_edit = -1;
+#define DEFAULT_STACK 0x00000C00
+#define DEFAULT_REVS 1
+#define DEFAULT_EDIT 0
 
 typedef struct vec {
 	char *buf;
@@ -124,17 +129,28 @@ void vec_free(Vec *vec) {
 	free(vec);
 }
 
-size_t make_idrefs(Vec *vec, arelent **rels, size_t nrels, asection *text, int for_text) {
+// A pointer in the initialized data: its offset in the data area, and
+// whether it points into .text.
+typedef struct idref {
+	uint32_t addr;
+	int text;
+} IdRef;
+
+int cmp_idref(const void *a, const void *b) {
+	uint32_t x = ((const IdRef*)a)->addr, y = ((const IdRef*)b)->addr;
+	return x < y ? -1 : x > y;
+}
+
+size_t make_idrefs(Vec *vec, IdRef *refs, size_t nrefs, int for_text) {
 	size_t iblock = vec_space(vec, 4);
 	size_t ihi = iblock;
 	uint16_t hi16 = -1;
 	uint16_t count = 0;
-	for(size_t i = 0; i < nrels; i++) {
-		arelent *rel = rels[i];
-		if((rel->sym_ptr_ptr[0]->section == text) != for_text) {
+	for(size_t i = 0; i < nrefs; i++) {
+		if(refs[i].text != for_text) {
 			continue;
 		}
-		uint32_t addr = rel->address;
+		uint32_t addr = refs[i].addr;
 		if(hi16 != (addr >> 16)) {
 			if(0 < count) {
 				uint16_t *p = (uint16_t*)(vec->buf + ihi);
@@ -198,9 +214,9 @@ int opt(int *argc, char ***argv) {
 		case 'h':
 			printf("usage: %s [OPTIONS] ELFFILE OUTFILE\n", *argv[0]);
 			printf("  -n, --name=MODNAME     override module name, default lowercase basename of ELFFILE\n");
-			printf("  -s, --stack=STACKSIZE  set stack size, default 0x%X\n", opt_stack);
-			printf("  -r, --revs=REVISION    set module revision, default %d\n", opt_revs);
-			printf("  -e, --edit=EDITION     set module edition (not used by OS), default %d\n", opt_edit);
+			printf("  -s, --stack=STACKSIZE  set stack size, default __os9_stack or 0x%X\n", DEFAULT_STACK);
+			printf("  -r, --revs=REVISION    set module revision, default from __os9_attrev or %d\n", DEFAULT_REVS);
+			printf("  -e, --edit=EDITION     set module edition (not used by OS), default __os9_edition or %d\n", DEFAULT_EDIT);
 			printf("  -h, --help             show this help\n");
 			return 0;
 		case -1:
@@ -261,10 +277,9 @@ int main(int argc, char *argv[]) {
 		bfd_perror(".text not found");
 		return 1;
 	}
-	if(bfd_section_vma(text) != 0) {
-		puts(".text VMA is not 0, not supported yet");
-		return 1;
-	}
+	// .text may be at any VMA: everything is computed relative to it.
+	// (With remote data, the data area reaches above 0, so .text must be
+	// placed above it.)
 	bfd_size_type tsize = bfd_section_size(text);
 	bfd_vma tvma = bfd_section_vma(text);
 	if(tsize % 2) {
@@ -278,7 +293,7 @@ int main(int argc, char *argv[]) {
 		return 1;
 	}
 	bfd_size_type dsize = bfd_section_size(data);
-	bfd_vma dvma = bfd_section_vma(data);
+	bfd_vma dvma = bfd_section_vma(data); // the data area's base, see below
 	if(dsize % 2) {
 		puts(".data size not aligned to word (2bytes)");
 		return 1;
@@ -291,11 +306,58 @@ int main(int argc, char *argv[]) {
 	}
 	bfd_size_type bsize = bfd_section_size(bss);
 
+	// Remote data (optional): after .bss, beyond the 64K a6 window.
+	asection *rdata = bfd_get_section_by_name(abfd, ".remote.data");
+	asection *rbss = bfd_get_section_by_name(abfd, ".remote.bss");
+	bfd_size_type rdsize = rdata ? bfd_section_size(rdata) : 0;
+	bfd_size_type rbsize = rbss ? bfd_section_size(rbss) : 0;
+	if(rdsize % 2) {
+		puts(".remote.data size not aligned to word (2bytes)");
+		return 1;
+	}
+
+	// The data area starts at the lowest data section (.data, or .bss if
+	// the linker script puts it first) and ends with the last one.
+	// Addresses are compared as signed 32-bit values and offsets computed
+	// modulo 2^32: the area starts at -0x8000, and with more than 32K of
+	// data, sections cross from 0xFFFFFFFF to 0 (ld --no-check-sections).
+	if((int32_t)bfd_section_vma(bss) < (int32_t)dvma) dvma = bfd_section_vma(bss);
+#define DOFF(vma) ((uint32_t)((vma) - dvma))
+	uint32_t dend = DOFF(bfd_section_vma(data)) + dsize;
+	if(DOFF(bfd_section_vma(bss)) + bsize > dend) dend = DOFF(bfd_section_vma(bss)) + bsize;
+	if(rdsize && DOFF(bfd_section_vma(rdata)) + rdsize > dend) dend = DOFF(bfd_section_vma(rdata)) + rdsize;
+	if(rbsize && DOFF(bfd_section_vma(rbss)) + rbsize > dend) dend = DOFF(bfd_section_vma(rbss)) + rbsize;
+	// The initialized data is one block covering .data and, if present,
+	// .remote.data; whatever lies between (usually .bss) is stored as
+	// zeros, so a linker script with remote initialized data should put
+	// .bss before .data.
+	uint32_t idstart = DOFF(bfd_section_vma(data)), idend = idstart + dsize;
+	if(rdsize) {
+		if(DOFF(bfd_section_vma(rdata)) < idstart) idstart = DOFF(bfd_section_vma(rdata));
+		if(DOFF(bfd_section_vma(rdata)) + rdsize > idend) idend = DOFF(bfd_section_vma(rdata)) + rdsize;
+	}
+	uint32_t idsize = idend - idstart;
+
 	// relocations (with symbols required by bfd)
 	// symtab not required directly but required for relocs
 	long symsz = bfd_get_symtab_upper_bound(abfd);
 	asymbol **syms = malloc(symsz);
-	/*long nsyms =*/ bfd_canonicalize_symtab(abfd, syms);
+	long nsyms = bfd_canonicalize_symtab(abfd, syms);
+
+	// Module header values from a mainline ROF converted by rof2elf.
+	asymbol *s_tylan = NULL, *s_attrev = NULL, *s_edition = NULL, *s_stack = NULL, *s_entry = NULL, *s_trapent = NULL;
+	for(long i = 0; i < nsyms; i++) {
+		const char *n = bfd_asymbol_name(syms[i]);
+		if(!strcmp(n, "__os9_tylan")) s_tylan = syms[i];
+		else if(!strcmp(n, "__os9_attrev")) s_attrev = syms[i];
+		else if(!strcmp(n, "__os9_edition")) s_edition = syms[i];
+		else if(!strcmp(n, "__os9_stack")) s_stack = syms[i];
+		else if(!strcmp(n, "__os9_entry")) s_entry = syms[i];
+		else if(!strcmp(n, "__os9_trapent")) s_trapent = syms[i];
+	}
+	if(s_entry) {
+		entry = bfd_asymbol_value(s_entry);
+	}
 
 	// .text relocs: no relocations to .data/.bss allowed, except
 	// R_68K_16 (a6-relative), and R_68K_32/R_68K_8 to .data/.bss or
@@ -307,7 +369,7 @@ int main(int argc, char *argv[]) {
 	for(long i = 0; i < ntrels; i++) {
 		arelent *rel = trels[i];
 		asection *ssec = rel->sym_ptr_ptr[0]->section;
-		int constant = bfd_is_abs_section(ssec) || ssec == data || ssec == bss;
+		int constant = bfd_is_abs_section(ssec) || ssec == data || ssec == bss || (ssec && (ssec == rdata || ssec == rbss));
 		if(!(ssec == text || rel->howto->type == 2 /* R_68K_16(%a6) */
 		     || ((rel->howto->type == 1 /* R_68K_32 */ || rel->howto->type == 3 /* R_68K_8 */) && constant))) {
 			printf(".text inter-section relocation not allowed: %s %08lx %s@%s+%08lx\n", rel->howto->name, rel->address, rel->sym_ptr_ptr[0]->name, rel->sym_ptr_ptr[0]->section->name, rel->addend);
@@ -315,17 +377,29 @@ int main(int argc, char *argv[]) {
 		}
 	}
 
-	// .data relocs: only R_68K_32 is allowed
-	long drelsz = bfd_get_reloc_upper_bound(abfd, data);
-	arelent **drels = malloc(drelsz);
-	long ndrels = bfd_canonicalize_reloc(abfd, data, drels, syms);
-	for(long i = 0; i < ndrels; i++) {
-		arelent *rel = drels[i];
-		if(rel->howto->type != 1 /* R_68K_32 */) {
-			printf(".data relocation other than R_68K_32 not allowed: %s %08lx %s@%s+%08lx\n", rel->howto->name, rel->address, rel->sym_ptr_ptr[0]->name, rel->sym_ptr_ptr[0]->section->name, rel->addend);
-			return 1;
+	// .data and .remote.data relocs: only R_68K_32 is allowed
+	asection *dsecs[2] = { data, rdsize ? rdata : NULL };
+	IdRef *drefs = NULL;
+	size_t ndrefs = 0;
+	for(int s = 0; s < 2; s++) {
+		asection *sec = dsecs[s];
+		if(!sec) continue;
+		long drelsz = bfd_get_reloc_upper_bound(abfd, sec);
+		arelent **drels = malloc(drelsz);
+		long ndrels = bfd_canonicalize_reloc(abfd, sec, drels, syms);
+		drefs = realloc(drefs, (ndrefs + (ndrels > 0 ? ndrels : 0) + 1) * sizeof(IdRef));
+		for(long i = 0; i < ndrels; i++) {
+			arelent *rel = drels[i];
+			if(rel->howto->type != 1 /* R_68K_32 */) {
+				printf("%s relocation other than R_68K_32 not allowed: %s %08lx %s@%s+%08lx\n", sec->name, rel->howto->name, rel->address, rel->sym_ptr_ptr[0]->name, rel->sym_ptr_ptr[0]->section->name, rel->addend);
+				return 1;
+			}
+			drefs[ndrefs].addr = DOFF(bfd_section_vma(sec)) + rel->address;
+			drefs[ndrefs].text = rel->sym_ptr_ptr[0]->section == text;
+			ndrefs++;
 		}
 	}
+	qsort(drefs, ndrefs, sizeof(IdRef), cmp_idref);
 
 	// generate
 	Vec *vec = vec_new(0x1000);
@@ -345,31 +419,33 @@ int main(int argc, char *argv[]) {
 	struct {
 		uint32_t off;
 		uint32_t len;
-	} idatahdr = { BE32(0), BE32(dsize) };
+	} idatahdr = { BE32(idstart), BE32(idsize) };
 	size_t iidatahdr = vec_append(vec, &idatahdr, sizeof(idatahdr));
-	size_t iidata = vec_space(vec, dsize);
-	if(!bfd_get_section_contents(abfd, data, vec->buf + iidata, 0, dsize)) {
+	size_t iidata = vec_zero(vec, idsize);
+	if(!bfd_get_section_contents(abfd, data, vec->buf + iidata + DOFF(bfd_section_vma(data)) - idstart, 0, dsize)) {
 		bfd_perror("could not read .data");
+		return 1;
+	}
+	if(rdsize && !bfd_get_section_contents(abfd, rdata, vec->buf + iidata + DOFF(bfd_section_vma(rdata)) - idstart, 0, rdsize)) {
+		bfd_perror("could not read .remote.data");
 		return 1;
 	}
 
 	// fix pointer in .data to 0-based
-	for(long i = 0; i < ndrels; i++) {
-		arelent *rel = drels[i];
-		asymbol *sym = rel->sym_ptr_ptr[0];
-		uint32_t *p = (void*)(vec->buf + iidata + rel->address);
+	for(size_t i = 0; i < ndrefs; i++) {
+		uint32_t *p = (void*)(vec->buf + iidata + drefs[i].addr - idstart);
 		uint32_t v = BE32(*p);
-		if(sym->section == text) {
+		if(drefs[i].text) {
 			*p = BE32(v - tvma + itext); // .text is offsetted by module header etc.
 		} else {
-			// we expect .data and .bss are contiguous
+			// we expect .data, .bss and remote data are contiguous
 			*p = BE32(v - dvma);
 		}
 	}
 
 	// idrefs
-	size_t iidrefs = make_idrefs(vec, drels, ndrels, text, 1);
-	make_idrefs(vec, drels, ndrels, text, 0);
+	size_t iidrefs = make_idrefs(vec, drefs, ndrefs, 1);
+	make_idrefs(vec, drefs, ndrefs, 0);
 
 	// crc, with pad on head
 	size_t icrc = vec_zero(vec, 4);
@@ -381,11 +457,13 @@ int main(int argc, char *argv[]) {
 	mh->owner = BE32(0x00000000); // uid=0 gid=0
 	mh->name = BE32(iname);
 	mh->accs = BE16(0x0555); // r-xr-xr-x
-	mh->type = 1; // prgm
-	mh->lang = 1; // objct
-	mh->attr = 0x80; // reentrant
-	mh->revs = opt_revs;
-	mh->edit = BE16(opt_edit); // any
+	uint16_t tylan = s_tylan ? bfd_asymbol_value(s_tylan) : 0x0101;
+	uint16_t attrev = s_attrev ? bfd_asymbol_value(s_attrev) : 0x8000 | DEFAULT_REVS;
+	mh->type = tylan >> 8; // prgm by default
+	mh->lang = tylan & 0xFF; // objct by default
+	mh->attr = attrev >> 8; // reentrant by default
+	mh->revs = opt_revs >= 0 ? opt_revs : (attrev & 0xFF);
+	mh->edit = BE16(opt_edit >= 0 ? opt_edit : s_edition ? (int)bfd_asymbol_value(s_edition) : DEFAULT_EDIT); // any
 	mh->usage = BE32(0); // reserved
 	mh->symbol = BE32(0); // reserved
 	uint16_t parity = 0xFFFF;
@@ -395,9 +473,9 @@ int main(int argc, char *argv[]) {
 	mh->parity = parity; // don't BE16, already swapped
 
 	mh->exec = BE32(itext + entry - tvma);
-	mh->excpt = BE32(0); // not supported by elf2mod
-	mh->mem = BE32(dsize + bsize);
-	mh->stack = BE32(opt_stack);
+	mh->excpt = BE32(s_trapent ? itext + bfd_asymbol_value(s_trapent) - tvma : 0); // uninitialized trap entry
+	mh->mem = BE32(dend);
+	mh->stack = BE32(opt_stack >= 0 ? opt_stack : s_stack ? (int)bfd_asymbol_value(s_stack) : DEFAULT_STACK);
 	mh->idata = BE32(iidatahdr);
 	mh->irefs = BE32(iidrefs);
 

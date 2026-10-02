@@ -43,7 +43,7 @@ define the symbols Microware's linker provides, such as `end`.
 | code | `.text` |
 | initialized data | `.data` |
 | uninitialized data | `.bss` |
-| remote initialized / uninitialized data | `.data.remote` / `.bss.remote` (not handled by elf2mod yet) |
+| remote initialized / uninitialized data | `.remote.data` / `.remote.bss` |
 | debug information | dropped |
 | global definitions | global symbols; `equ` definitions become absolute symbols, common definitions ELF common symbols |
 | external and local references | RELA relocations: `R_68K_8`, `R_68K_16`, `R_68K_32`, or `R_68K_PC8`, `R_68K_PC16`, `R_68K_PC32` for relative references; the addend is taken from the object bytes |
@@ -56,7 +56,7 @@ define the symbols Microware's linker provides, such as `end`.
 - Other combinations of references at one place are rejected, unless only equates are involved.
 - A mainline ROF (one with a module type, like `cstart.r`) also gets absolute symbols holding its
   module header values: `__os9_tylan`, `__os9_attrev`, `__os9_edition` and `__os9_stack`, and code
-  symbols `__os9_entry` and `__os9_trapent`.
+  symbols `__os9_entry` and `__os9_trapent`, which elf2mod uses for the module header.
 
 The ROF format is described in the *OS-9 Assembler/Linker User Manual*, chapter 3, "Relocatable
 Object File Format". Section 6 of
