@@ -25,6 +25,9 @@ DESTDIR=/usr
 EXE=elf2mod
 EXE_ROF2ELF=rof2elf
 EXE_ELF2ROF=elf2rof
+# m68k-os9-gcc, with these binutils of m68k-elfos9 as m68k-os9- too, so that
+# build systems find a complete toolchain (./configure --host=m68k-os9)
+OS9_TOOLS=ar as ld nm objcopy objdump ranlib readelf size strip
 
 CC=gcc
 CFLAGS=-g -I$(BFDPATH)/include -Wall -Wextra
@@ -41,6 +44,8 @@ install: $(EXE) $(EXE_ROF2ELF) $(EXE_ELF2ROF)
 	$(INSTALL) -s $(EXE) $(DESTDIR)/bin/$(EXE)
 	$(INSTALL) -s $(EXE_ROF2ELF) $(DESTDIR)/bin/$(EXE_ROF2ELF)
 	$(INSTALL) -s $(EXE_ELF2ROF) $(DESTDIR)/bin/$(EXE_ELF2ROF)
+	$(INSTALL) m68k-os9-gcc $(DESTDIR)/bin/m68k-os9-gcc
+	for t in $(OS9_TOOLS); do ln -sf m68k-elfos9-$$t $(DESTDIR)/bin/m68k-os9-$$t; done
 
 clean:
 	-$(RM) $(EXE) $(EXE_ROF2ELF) $(EXE_ELF2ROF)

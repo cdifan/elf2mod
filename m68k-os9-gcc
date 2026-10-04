@@ -1,0 +1,82 @@
+#!/bin/bash
+# m68k-os9-gcc: compiles and links an OS-9/68K program into a module in one
+# step, with newlib's OS-9 runtime (libgloss: -specs=os9.specs) and elf2mod.
+#
+#   m68k-os9-gcc [GCC OPTIONS] [-Wm,ELF2MOD OPTIONS] FILES... [-o PROG]
+#
+# Without -c, -S, -E or -M, it links PROG.elf (kept for debugging) and
+# makes it into the module PROG (a.out by default), named after PROG.
+# When the code is too large for 16-bit calls (more than 32 KB), the
+# first link fails with "relocation truncated" errors; m68k-os9-gcc then links
+# again with as large a jump table as elf2mod asks for, which it fills.
+# -Wm,OPTION,... passes options to elf2mod: -Wm,-g for a .stb symbol
+# module, -Wm,-e,EDITION, -Wm,-s,STACK, -Wm,-n,NAME and so on.
+#
+# Environment: OS9GCC_CC (default m68k-elfos9-gcc), ELF2MOD (default
+# elf2mod).
+#
+# MIT License; see elf2mod.c.
+
+set -u
+cc=${OS9GCC_CC:-m68k-elfos9-gcc}
+elf2mod=${ELF2MOD:-elf2mod}
+
+gccargs=()
+modargs=()
+out=a.out
+link=1
+while [ $# -gt 0 ]; do
+	case $1 in
+	-Wm,*)
+		IFS=, read -r -a more <<< "${1#-Wm,}"
+		modargs+=("${more[@]}") ;;
+	-o)
+		[ $# -ge 2 ] || { echo "m68k-os9-gcc: -o needs a file name" >&2; exit 1; }
+		out=$2; shift ;;
+	-o*)
+		out=${1#-o} ;;
+	-c|-S|-E|-M|-MM|-fsyntax-only|-print-*|-dump*|--version|--help|-v)
+		link=0
+		gccargs+=("$1") ;;
+	*)
+		gccargs+=("$1") ;;
+	esac
+	shift
+done
+
+if [ $link = 0 ]; then
+	if [ "$out" != a.out ]; then
+		gccargs+=(-o "$out")
+	fi
+	exec "$cc" -specs=os9.specs "${gccargs[@]}"
+fi
+
+elf=$out.elf
+log=$(mktemp) || exit 1
+trap 'rm -f "$log"' EXIT
+
+if "$cc" -specs=os9.specs "${gccargs[@]}" -o "$elf" 2> "$log"; then
+	cat "$log" >&2
+else
+	status=$?
+	# Only truncated (16-bit) relocations: a large program.  Anything
+	# else is an error to report.
+	if grep -v -e 'relocation truncated to fit' \
+		-e 'additional relocation overflows omitted' \
+		-e ': in function' -e 'DWARF error' \
+		-e 'ld returned 1 exit status' "$log" | grep -q .; then
+		cat "$log" >&2
+		exit $status
+	fi
+	"$cc" -specs=os9.specs "${gccargs[@]}" -o "$elf" -Wl,--noinhibit-exec 2> /dev/null
+	need=$("$elf2mod" -n "$(basename "$out")" "$elf" "$out" 2>&1 |
+		sed -n 's/.*jump table of [0-9]* entries (\([0-9]*\) bytes).*/\1/p')
+	if [ -z "$need" ]; then
+		cat "$log" >&2
+		exit $status
+	fi
+	"$cc" -specs=os9.specs "${gccargs[@]}" -o "$elf" -Wl,--noinhibit-exec \
+		-Wl,--defsym,__jmptbl_size="$need" 2> /dev/null || exit
+fi
+
+exec "$elf2mod" -n "$(basename "$out")" "${modargs[@]}" "$elf" "$out"
