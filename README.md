@@ -27,15 +27,27 @@ itself is Murachue's, with extensions; rof2elf and elf2rof are new.
   32 KB of code is linked again with the jump table elf2mod asks for. On OS-9, `malloc` has 16 KB
   plus what the shell's `#` modifier adds (`hello #64k`); see `os9.ld` in newlib's
   `libgloss/m68k` for the module's defaults.
+- [m68k-os9-xcc](m68k-os9-xcc.md): a drop-in for Microware C 3.2's `xcc`/`cc` in existing
+  makefiles: takes their options and runs GCC, rof2elf, GNU ld and elf2mod instead. It uses the
+  user's own Microware headers and libraries (`CDEF`, `CLIB`), converted to ELF on demand:
+
+  ```
+  m68k-os9-xcc -r=RELS pp.c            # RELS/pp.r, an ELF object (-obj=rof for ROF)
+  m68k-os9-xcc RELS/pp.r -f=pp -m=8    # links with cstart.r and clibn.l, math.l, sys.l
+  ```
+
+  `m68k-os9-xcc -?` lists the options, with what each one does here.
 
 # Build and install
 
 - Pre-requisite: BFD for m68k-elfos9 is installed. (binutils with `--enable-install-libbfd`)
   - Only elf2mod needs it; rof2elf and elf2rof need just a C compiler.
+  - m68k-os9-xcc needs libiberty (`libiberty-dev` on Debian and Ubuntu; `LIBIBERTY_CFLAGS` in
+    Makefile for its headers).
 - Tweak `BFDPATH` in Makefile (if you are not on linux-amd64)
 - `make && make install`
   - you can specify DESTDIR= to set install prefix.
-	- `make DESTDIR=/usr install` installs elf2mod, rof2elf, elf2rof and m68k-os9-gcc in `/usr/bin`,
+	- `make DESTDIR=/usr install` installs elf2mod, rof2elf, elf2rof, m68k-os9-gcc and m68k-os9-xcc in `/usr/bin`,
 	  with `m68k-os9-` links to the `m68k-elfos9-` binutils (`ar`, `as`, `ld`, ...)
 - Profit!
 

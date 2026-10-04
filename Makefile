@@ -25,6 +25,11 @@ DESTDIR=/usr
 EXE=elf2mod
 EXE_ROF2ELF=rof2elf
 EXE_ELF2ROF=elf2rof
+# xcc's options (Microware C 3.2) for GCC; libiberty runs the programs
+EXE_XCC=m68k-os9-xcc
+XCC_SRCS=m68k-os9-xcc.c os9link.c hostsys.c
+XCC_HDRS=os9link.h hostsys.h
+LIBIBERTY_CFLAGS=-I/usr/include/libiberty
 # m68k-os9-gcc, with these binutils of m68k-elfos9 as m68k-os9- too, so that
 # build systems find a complete toolchain (./configure --host=m68k-os9)
 OS9_TOOLS=ar as ld nm objcopy objdump ranlib readelf size strip
@@ -38,17 +43,18 @@ RM=rm
 
 .PHONY: all clean
 
-all: $(EXE) $(EXE_ROF2ELF) $(EXE_ELF2ROF)
+all: $(EXE) $(EXE_ROF2ELF) $(EXE_ELF2ROF) $(EXE_XCC)
 
-install: $(EXE) $(EXE_ROF2ELF) $(EXE_ELF2ROF)
+install: $(EXE) $(EXE_ROF2ELF) $(EXE_ELF2ROF) $(EXE_XCC)
 	$(INSTALL) -s $(EXE) $(DESTDIR)/bin/$(EXE)
 	$(INSTALL) -s $(EXE_ROF2ELF) $(DESTDIR)/bin/$(EXE_ROF2ELF)
 	$(INSTALL) -s $(EXE_ELF2ROF) $(DESTDIR)/bin/$(EXE_ELF2ROF)
+	$(INSTALL) -s $(EXE_XCC) $(DESTDIR)/bin/$(EXE_XCC)
 	$(INSTALL) m68k-os9-gcc $(DESTDIR)/bin/m68k-os9-gcc
 	for t in $(OS9_TOOLS); do ln -sf m68k-elfos9-$$t $(DESTDIR)/bin/m68k-os9-$$t; done
 
 clean:
-	-$(RM) $(EXE) $(EXE_ROF2ELF) $(EXE_ELF2ROF)
+	-$(RM) $(EXE) $(EXE_ROF2ELF) $(EXE_ELF2ROF) $(EXE_XCC)
 
 $(EXE): elf2mod.c
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LIBS)
@@ -59,3 +65,6 @@ $(EXE_ROF2ELF): rof2elf.c
 
 $(EXE_ELF2ROF): elf2rof.c
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
+
+$(EXE_XCC): $(XCC_SRCS) $(XCC_HDRS)
+	$(CC) $(CFLAGS) $(LIBIBERTY_CFLAGS) $(LDFLAGS) -o $@ $(XCC_SRCS) -liberty
