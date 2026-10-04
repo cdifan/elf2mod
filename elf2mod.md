@@ -117,6 +117,37 @@ module), and each far reference is redirected through it, keeping its size:
 - `move.l` changes the condition codes where `pea` doesn't; that only matters for hand-written
   assembly that relies on them.
 
+## The linker's module symbols (this fork)
+
+Microware's linker defines symbols for the module's start, name and end, which Microware's
+libraries use: C 3.2's `clib.l` (`_errmsg`, which finds the module's name through `btext`) and
+`cio.l` refer to `btext`. Their values depend on the module's layout, which only elf2mod knows,
+so it puts them into every reference to them:
+
+| Symbol | Value |
+|---|---|
+| `btext`, `_btext` | the module's start (offset 0) |
+| `bname`, `_bname` | the module's name |
+| `etext`, `_etext` | the module's end (its size) |
+
+The linker script only has to define them, with any value, so that ld accepts the references;
+`PROVIDE` defines them only when something refers to them:
+
+```
+    .text : { ... }
+    PROVIDE (btext = ADDR(.text)); PROVIDE (_btext = ADDR(.text));
+    PROVIDE (bname = ADDR(.text)); PROVIDE (_bname = ADDR(.text));
+    PROVIDE (etext = ADDR(.text)); PROVIDE (_etext = ADDR(.text));
+```
+
+A pointer to one of them in the initialized data is relocated when OS-9 loads the module, as any
+pointer into the code; a PC-relative reference in the code gets the right displacement, and a far
+one goes through the jump table, like any far reference (so link with `--noinhibit-exec` then).
+`etext` is only known at the end, so a reference to it is taken as near only if even the largest the
+module can become is in reach; a far one must be to `etext` itself, without an offset. Other symbols
+Microware's linker defines are ordinary link-time values the linker script gives: `end` (Ultra C:
+`_enddata`), the end of the data area, and `_jmptbl`.
+
 ## Symbol modules for the debugger (this fork)
 
 With `-g` (`--stb[=STYLE]`), elf2mod also writes a symbol module `OUTFILE.stb`, as Microware's linker

@@ -144,6 +144,38 @@ int cmp_idref(const void *a, const void *b) {
 	return x < y ? -1 : x > y;
 }
 
+// Symbols Microware's linker defines whose values depend on the module's
+// layout, which only elf2mod knows (this fork): btext, the module's start
+// (offset 0), bname, its name, and etext, its end (the module's size), and
+// the underscored forms Ultra C's l68 uses. Linker scripts PROVIDE them with
+// any value; elf2mod puts the module offset into every reference to them,
+// which ld -q keeps: a pointer in the initialized data (relocated when OS-9
+// loads the module, as any pointer into the code), or a PC-relative
+// reference in the code.
+enum { LSYM_NONE, LSYM_BTEXT, LSYM_BNAME, LSYM_ETEXT };
+
+// The jump table target standing for etext until the module's size is
+// known (no code is there: .text never reaches the top of memory).
+#define ETEXT_TARGET ((bfd_vma)0xFFFFFFFE)
+
+int linker_symbol(const asymbol *s) {
+	const char *n = bfd_asymbol_name(s);
+	if(*n == '_') n++;
+	if(!strcmp(n, "btext")) return LSYM_BTEXT;
+	if(!strcmp(n, "bname")) return LSYM_BNAME;
+	if(!strcmp(n, "etext")) return LSYM_ETEXT;
+	return LSYM_NONE;
+}
+
+// A reference to such a symbol: where (an offset in .text, or in the data
+// area), which symbol, the relocation type, and the addend.
+typedef struct lsref {
+	uint32_t addr;
+	int kind;
+	int type;
+	int64_t addend;
+} LsRef;
+
 size_t make_idrefs(Vec *vec, IdRef *refs, size_t nrefs, int for_text) {
 	size_t iblock = vec_space(vec, 4);
 	size_t ihi = iblock;
@@ -455,10 +487,23 @@ int main(int argc, char *argv[]) {
 	arelent **trels = malloc(trelsz);
 	long ntrels = bfd_canonicalize_reloc(abfd, text, trels, syms);
 	char *refd = calloc(nsyms + 1, 1); // symbols that relocations refer to (for -g)
+	LsRef *tls = NULL, *dls = NULL; // references to linker symbols in .text, data
+	size_t ntls = 0, ndls = 0;
+	int64_t etext_entry = -1; // the jump table entry for etext: its offset in the data area
 	for(long i = 0; i < ntrels; i++) {
 		arelent *rel = trels[i];
 		asection *ssec = rel->sym_ptr_ptr[0]->section;
 		if(rel->sym_ptr_ptr >= syms && rel->sym_ptr_ptr < syms + nsyms) refd[rel->sym_ptr_ptr - syms] = 1;
+		int ls = linker_symbol(rel->sym_ptr_ptr[0]);
+		if(ls) {
+			if(rel->howto->type != 4 /* R_68K_PC32 */ && rel->howto->type != 5 /* R_68K_PC16 */) {
+				printf("%s at .text+%08lx: only PC-relative references to %s are supported\n", rel->howto->name, rel->address, rel->sym_ptr_ptr[0]->name);
+				return 1;
+			}
+			tls = realloc(tls, (ntls + 1) * sizeof(LsRef));
+			tls[ntls++] = (LsRef){ rel->address, ls, rel->howto->type, rel->addend };
+			continue;
+		}
 		if(bfd_is_und_section(ssec)) {
 			printf("undefined symbol %s (.text+%08lx)\n", rel->sym_ptr_ptr[0]->name, rel->address);
 			return 1;
@@ -511,6 +556,17 @@ int main(int argc, char *argv[]) {
 			// weak symbol (0, as ld resolved it) stays as it is.
 			asymbol *s = rel->sym_ptr_ptr[0];
 			asection *ssec = s->section;
+			int ls = linker_symbol(s);
+			if(ls) {
+				// A pointer into the module, relocated at load time; its
+				// value is set once the module's layout is known.
+				drefs[ndrefs].addr = DOFF(bfd_section_vma(sec)) + rel->address;
+				drefs[ndrefs].text = 1;
+				ndrefs++;
+				dls = realloc(dls, (ndls + 1) * sizeof(LsRef));
+				dls[ndls++] = (LsRef){ DOFF(bfd_section_vma(sec)) + rel->address, ls, rel->howto->type, rel->addend };
+				continue;
+			}
 			if(bfd_is_abs_section(ssec) || (bfd_is_und_section(ssec) && (s->flags & BSF_WEAK))) {
 				continue;
 			}
@@ -580,15 +636,43 @@ int main(int argc, char *argv[]) {
 		}
 		bfd_vma *targets = NULL;
 		size_t ntargets = 0, nfar = 0;
+		// The most the module can grow to: what's laid out so far (header,
+		// name, code, initialized data), then the two relocation tables
+		// (4 bytes per 64K group and 2 per pointer, a 4-byte end each; at
+		// most a group per pointer: the data pointers and the table's
+		// entries), then the CRC. A reference to etext is near only if it
+		// reaches even that far.
+		size_t jtcap = have_jt && have_ejt && (int32_t)(ejt - jt) >= 0 ? (size_t)(int32_t)(ejt - jt) / 6 : 0;
+		uint64_t maxend = vec->len + 8 + 6 * (uint64_t)(ndrefs + jtcap) + 4;
 		for(long i = 0; i < ntrels; i++) {
 			arelent *rel = trels[i];
 			if(rel->howto->type != 5 /* R_68K_PC16 */ && rel->howto->type != 14 /* R_68K_PLT16 */) {
 				continue;
 			}
-			bfd_vma target = bfd_asymbol_value(rel->sym_ptr_ptr[0]) + rel->addend;
-			int32_t disp = (int32_t)(target - (tvma + rel->address));
+			// btext and bname (see linker_symbol): their real addresses, in
+			// .text's terms, so a far one also goes through the table.
+			// etext, the module's end, isn't known yet: near only if even
+			// the largest the module can be is in reach (maxend); else an
+			// entry, filled in below.
+			int ls = linker_symbol(rel->sym_ptr_ptr[0]);
+			bfd_vma target = ls == LSYM_ETEXT ? ETEXT_TARGET
+				: ls ? tvma - itext + (ls == LSYM_BNAME ? iname : 0) + rel->addend
+				: bfd_asymbol_value(rel->sym_ptr_ptr[0]) + rel->addend;
+			int64_t edisp = (int64_t)maxend + rel->addend - (int64_t)(itext + rel->address);
+			int32_t disp = ls == LSYM_ETEXT ? (edisp > 0x7FFF ? 0x8000 : (int32_t)edisp)
+				: (int32_t)(target - (tvma + rel->address));
 			if(-0x8000 <= disp && disp <= 0x7FFF) {
 				continue;
+			}
+			if(ls == LSYM_ETEXT && rel->addend != 0) {
+				printf("far reference to %s%+ld at .text+%08lx: only etext itself can go through the jump table\n", rel->sym_ptr_ptr[0]->name, (long)rel->addend, rel->address);
+				return 1;
+			}
+			// Done here, not with the near ones below.
+			for(size_t k = 0; ls && k < ntls; k++) {
+				if(tls[k].addr == rel->address) {
+					tls[k].kind = LSYM_NONE;
+				}
 			}
 			nfar++;
 			if(rel->address < 2) {
@@ -648,6 +732,9 @@ int main(int argc, char *argv[]) {
 				e[0] = 0x4E; e[1] = 0xF9;
 				uint32_t t = targets[k];
 				e[2] = t >> 24; e[3] = t >> 16; e[4] = t >> 8; e[5] = t;
+				if(targets[k] == ETEXT_TARGET) {
+					etext_entry = eoff + 2; // the address, filled in at the end
+				}
 				drefs[ndrefs].addr = eoff + 2;
 				drefs[ndrefs].text = 1;
 				ndrefs++;
@@ -705,6 +792,41 @@ int main(int argc, char *argv[]) {
 	mh->stack = BE32(opt_stack >= 0 ? opt_stack : s_stack ? (int)bfd_asymbol_value(s_stack) : DEFAULT_STACK);
 	mh->idata = BE32(iidatahdr);
 	mh->irefs = BE32(iidrefs);
+
+	// References to btext, bname and etext (see linker_symbol), now that
+	// the module's layout and size are known.
+	for(size_t i = 0; i < ntls + ndls; i++) {
+		LsRef *r = i < ntls ? &tls[i] : &dls[i - ntls];
+		if(r->kind == LSYM_NONE) {
+			continue; // a far one, through the jump table
+		}
+		int64_t off = r->kind == LSYM_BTEXT ? 0 : r->kind == LSYM_BNAME ? (int64_t)iname : (int64_t)vec->len;
+		if(i < ntls) {
+			// PC-relative: from the field itself, as GNU ld computes it.
+			int64_t v = off + r->addend - (int64_t)(itext + r->addr);
+			unsigned char *p = (unsigned char*)vec->buf + itext + r->addr;
+			if(r->type == 5 /* R_68K_PC16 */) {
+				if(v < -0x8000 || v > 0x7FFF) {
+					// Can't happen: far ones went through the jump table,
+					// and etext was judged by the largest module size.
+					printf("R_68K_PC16 at .text+%08x: %s beyond 32K (internal error)\n", r->addr, r->kind == LSYM_ETEXT ? "etext" : "a module symbol");
+					return 1;
+				}
+				p[0] = v >> 8; p[1] = v;
+			} else {
+				p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v;
+			}
+		} else {
+			uint32_t *p = (void*)(vec->buf + iidata + r->addr - idstart);
+			*p = BE32((uint32_t)(off + r->addend));
+		}
+	}
+	if(etext_entry >= 0) {
+		uint32_t *p = (void*)(vec->buf + iidata + etext_entry - idstart);
+		*p = BE32((uint32_t)vec->len);
+	}
+	free(tls);
+	free(dls);
 
 	// update crc
 	uint32_t crc = module_crc(vec->buf, vec->len - 3);
