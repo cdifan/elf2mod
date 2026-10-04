@@ -1,7 +1,8 @@
 /*
  * rof2elf: convert Microware OS-9/68000 ROF objects (.r) and libraries
- * (.l, concatenated ROFs) to m68k ELF relocatables and ar archives, for
- * linking with GNU ld and converting with elf2mod.
+ * (.l: concatenated ROFs, or Ultra C's libgen format) to m68k ELF
+ * relocatables and ar archives, for linking with GNU ld and converting
+ * with elf2mod.
  *
  * MIT License
  *
@@ -360,6 +361,263 @@ parse_rof (In *in, Rof *r)
   while (in->p < in->end && *in->p == 0)
     in->p++;
   return 1;
+}
+
+/* Libraries made by Ultra C's libgen: one file holding the psects of
+   several ROFs, with a hash table and lists of their definitions and
+   references, described in Using Ultra C/C++, chapter 9, "Library Format
+   Created by libgen".  Format type 1 holds ROF edition 9 or 9.1 psects
+   (the 68000's); type 3 (ROF edition 15) is another processor family's.
+   What the manual leaves out was found with libgen itself (SDK 3.2.4):
+   the header has the reserved 4 bytes in type 1 too, so it is 46 bytes;
+   a psect entry has one 4-byte field more than listed, after the stack
+   size (checked with r68 psects of different stack sizes, editions and
+   entry points: the stack size is there, the extra field stays zero; the
+   edition and entry points aren't kept, and libgen refuses mainline
+   psects); reference entries are 16 bytes, with a 4-byte count; indices
+   count entries, -1 ends a list.  Each psect's code is followed by its
+   initialized data, remote
+   initialized data and debug information, as in a ROF; its local
+   references are a count and the references, as in a ROF.  */
+#define LIBGEN_ID	0x2D00D5BC
+#define LIBGEN_HEADER	46
+#define LIBGEN_DEF	22
+#define LIBGEN_PSECT1	66
+#define LIBGEN_REF	16
+#define LIBGEN_END	0xFFFFFFFF
+
+/* The bytes at OFFSET of data of SIZE, holding N items of ITEM bytes.  */
+static const unsigned char *
+lib_at (const unsigned char *data, size_t size, uint32_t offset, uint32_t n,
+	size_t item, const char *file)
+{
+  if (offset > size || (uint64_t) n * item > size - offset)
+    die ("%s: bad offset in libgen library", file);
+  return data + offset;
+}
+
+static uint32_t
+lib32 (const unsigned char *p)
+{
+  return ((uint32_t) p[0] << 24) | ((uint32_t) p[1] << 16) | (p[2] << 8) | p[3];
+}
+
+static unsigned
+lib16 (const unsigned char *p)
+{
+  return (p[0] << 8) | p[1];
+}
+
+/* Whether DATA, of SIZE bytes, is a libgen library.  */
+static int
+is_libgen (const unsigned char *data, size_t size)
+{
+  return size >= 4 && lib32 (data) == LIBGEN_ID;
+}
+
+/* The references of a libgen reference list: COUNT of them at OFFSET, each
+   a type and an offset, as in a ROF, all to external symbol EXT.  */
+static void
+lib_refs (const unsigned char *data, size_t size, uint32_t count,
+	  uint32_t offset, int ext, Rof *r, int *nalloc, const char *file)
+{
+  const unsigned char *p = lib_at (data, size, offset, count, 6, file);
+  uint32_t i;
+  if ((uint64_t) r->nrefs + count > INT_MAX)
+    die ("%s: too many references in libgen library", file);
+  if (r->nrefs + (int) count > *nalloc)
+    {
+      while (r->nrefs + (int) count > *nalloc)
+	*nalloc = *nalloc ? 2 * *nalloc : 16;
+      r->refs = realloc (r->refs, *nalloc * sizeof (Ref));
+      if (!r->refs)
+	die ("out of memory%s", "");
+    }
+  for (i = 0; i < count; i++, p += 6)
+    {
+      r->refs[r->nrefs].type = lib16 (p);
+      r->refs[r->nrefs].offset = lib32 (p + 2);
+      r->refs[r->nrefs].ext = ext;
+      r->nrefs++;
+    }
+}
+
+static int
+cmp_name (const void *a, const void *b)
+{
+  return strcmp (*(char *const *) a, *(char *const *) b);
+}
+
+/* Sorts R's external names, as r68 writes them in a ROF (libgen lists
+   the names the library defines first), so a psect converts to the same
+   ELF object from a library as from its ROF.  */
+static void
+sort_exts (Rof *r)
+{
+  char **sorted = xmalloc ((r->nexts ? r->nexts : 1) * sizeof (char *));
+  int *map = xmalloc ((r->nexts ? r->nexts : 1) * sizeof (int));
+  int i, j;
+
+  memcpy (sorted, r->exts, r->nexts * sizeof (char *));
+  qsort (sorted, r->nexts, sizeof (char *), cmp_name);
+  for (i = 0; i < r->nexts; i++)
+    for (j = 0; j < r->nexts; j++)
+      if (sorted[j] == r->exts[i])
+	map[i] = j;
+  for (i = 0; i < r->nrefs; i++)
+    if (r->refs[i].ext >= 0)
+      r->refs[i].ext = map[r->refs[i].ext];
+  free (r->exts);
+  free (map);
+  r->exts = sorted;
+}
+
+/* Parses the libgen library DATA of SIZE bytes into *NROFS ROFs at *ROFS.  */
+static void
+parse_libgen (const unsigned char *data, size_t size, const char *file,
+	      Rof **rofs, int *nrofs)
+{
+  uint32_t hsize, dsize, ssize, psize, isize, esize, ndefs, npsects, nirefs,
+	   nerefs, i;
+  const unsigned char *defs, *strs, *psects, *irefs, *erefs, *h;
+  unsigned type;
+  uint64_t at;
+
+  if (size < LIBGEN_HEADER)
+    die ("%s: truncated libgen library", file);
+  type = lib16 (data + 4) & 0xFF;
+  if (type != 1)
+    {
+      char fmt[64];
+      sprintf (fmt, "%%s: unsupported libgen library type %u", type);
+      die (fmt, file);
+    }
+  hsize = lib32 (data + 18);
+  dsize = lib32 (data + 22);
+  ssize = lib32 (data + 26);
+  psize = lib32 (data + 30);
+  isize = lib32 (data + 34);
+  esize = lib32 (data + 38);
+  at = (uint64_t) LIBGEN_HEADER + hsize + dsize + ssize + psize + isize + esize;
+  if (at > size)
+    die ("%s: truncated libgen library", file);
+  at = LIBGEN_HEADER + hsize;
+  defs = data + at;
+  strs = defs + dsize;
+  psects = strs + ssize;
+  irefs = psects + psize;
+  erefs = irefs + isize;
+  ndefs = dsize / LIBGEN_DEF;
+  npsects = psize / LIBGEN_PSECT1;
+  nirefs = isize / LIBGEN_REF;
+  nerefs = esize / LIBGEN_REF;
+
+  /* A name in the string table.  */
+#define LIBGEN_NAME(off)						\
+  ((off) < ssize && memchr (strs + (off), 0, ssize - (off))		\
+   ? strdup ((const char *) strs + (off))				\
+   : (die ("%s: bad name in libgen library", file), (char *) NULL))
+
+  *rofs = xmalloc ((npsects ? npsects : 1) * sizeof (Rof));
+  *nrofs = npsects;
+  for (i = 0; i < npsects; i++)
+    {
+      Rof *r = &(*rofs)[i];
+      const unsigned char *e = psects + (size_t) i * LIBGEN_PSECT1;
+      unsigned series = lib16 (e);
+      uint32_t codeoff, locoff, ihead, ehead, dhead, n, k, guard;
+      int nalloc = 0, wide;
+
+      memset (r, 0, sizeof *r);
+      if (series != 9 && series != 0xF9)
+	{
+	  char fmt[64];
+	  sprintf (fmt, "%%s: unsupported ROF series 0x%04X in libgen library",
+		   series);
+	  die (fmt, file);
+	}
+      wide = series == 0xF9;
+      r->statics = lib32 (e + 2);
+      r->idata = lib32 (e + 6);
+      r->rstatics = lib32 (e + 10);
+      r->ridata = lib32 (e + 14);
+      r->code = lib32 (e + 18);
+      r->debug = lib32 (e + 22);
+      r->stack = lib32 (e + 26);
+      codeoff = lib32 (e + 34);
+      locoff = lib32 (e + 38);
+      ihead = lib32 (e + 50);
+      ehead = lib32 (e + 54);
+      r->name = LIBGEN_NAME (lib32 (e + 58));
+      dhead = lib32 (e + 62);
+
+      if ((uint64_t) codeoff + r->code + r->idata + r->ridata + r->debug > size)
+	die ("%s: truncated libgen library", file);
+      r->codep = data + codeoff;
+      r->datap = r->codep + r->code;
+      r->rdatap = r->datap + r->idata;
+
+      /* Definitions: the psect's list in the global definition section.  */
+      for (k = dhead, guard = 0; k != LIBGEN_END; guard++)
+	{
+	  if (k >= ndefs || guard >= ndefs)
+	    die ("%s: bad definition list in libgen library", file);
+	  h = defs + (size_t) k * LIBGEN_DEF;
+	  r->defs = realloc (r->defs, (r->ndefs + 1) * sizeof (Def));
+	  if (!r->defs)
+	    die ("out of memory%s", "");
+	  r->defs[r->ndefs].type = lib16 (h);
+	  r->defs[r->ndefs].value = lib32 (h + 2);
+	  r->defs[r->ndefs].name = LIBGEN_NAME (lib32 (h + 6));
+	  r->ndefs++;
+	  k = lib32 (h + 14);
+	}
+
+      /* References to symbols the library defines (by definition) and to
+	 others (by name): each an external symbol of this psect.  */
+      for (k = ihead, guard = 0; k != LIBGEN_END; guard++)
+	{
+	  uint32_t def;
+	  if (k >= nirefs || guard >= nirefs)
+	    die ("%s: bad reference list in libgen library", file);
+	  h = irefs + (size_t) k * LIBGEN_REF;
+	  def = lib32 (h + 12);
+	  if (def >= ndefs)
+	    die ("%s: bad reference in libgen library", file);
+	  r->exts = realloc (r->exts, (r->nexts + 1) * sizeof (char *));
+	  if (!r->exts)
+	    die ("out of memory%s", "");
+	  r->exts[r->nexts] =
+	    LIBGEN_NAME (lib32 (defs + (size_t) def * LIBGEN_DEF + 6));
+	  lib_refs (data, size, lib32 (h), lib32 (h + 4), r->nexts, r, &nalloc,
+		    file);
+	  r->nexts++;
+	  k = lib32 (h + 8);
+	}
+      for (k = ehead, guard = 0; k != LIBGEN_END; guard++)
+	{
+	  if (k >= nerefs || guard >= nerefs)
+	    die ("%s: bad reference list in libgen library", file);
+	  h = erefs + (size_t) k * LIBGEN_REF;
+	  r->exts = realloc (r->exts, (r->nexts + 1) * sizeof (char *));
+	  if (!r->exts)
+	    die ("out of memory%s", "");
+	  r->exts[r->nexts] = LIBGEN_NAME (lib32 (h + 12));
+	  lib_refs (data, size, lib32 (h), lib32 (h + 4), r->nexts, r, &nalloc,
+		    file);
+	  r->nexts++;
+	  k = lib32 (h + 8);
+	}
+
+      /* Local references: a count (2 or 4 bytes, by the ROF series) and
+	 the references.  */
+      h = lib_at (data, size, locoff, 1, wide ? 4 : 2, file);
+      n = wide ? lib32 (h) : lib16 (h);
+      lib_refs (data, size, n, locoff + (wide ? 4 : 2), -1, r, &nalloc, file);
+
+      sort_exts (r);
+    }
+#undef LIBGEN_NAME
 }
 
 /* ELF output.  Sections, in this order.  */
@@ -820,22 +1078,45 @@ read_file (const char *name, long *size)
   return data;
 }
 
+/* Reads the ROF or library NAME (concatenated ROFs, or libgen's format)
+   into *NROFS ROFs at *ROFS.  */
+static void
+read_rofs (const char *name, Rof **rofs, int *nrofs)
+{
+  long size;
+  In in;
+  unsigned char *data = read_file (name, &size);
+
+  if (is_libgen (data, size))
+    {
+      parse_libgen (data, size, name, rofs, nrofs);
+      return;
+    }
+  in.p = data;
+  in.end = data + size;
+  in.file = name;
+  *rofs = NULL;
+  *nrofs = 0;
+  while (in.p < in.end)
+    {
+      *rofs = realloc (*rofs, (*nrofs + 1) * sizeof (Rof));
+      if (!*rofs)
+	die ("out of memory%s", "");
+      if (!parse_rof (&in, &(*rofs)[*nrofs]))
+	die ("%s: not a ROF (no sync bytes)", name);
+      (*nrofs)++;
+    }
+}
+
 /* Load the equates defined in the ROF or library NAME.  */
 static void
 load_equates (const char *name)
 {
-  long size;
-  In in;
-  Rof r;
-  in.p = read_file (name, &size);
-  in.end = in.p + size;
-  in.file = name;
-  while (in.p < in.end)
-    {
-      if (!parse_rof (&in, &r))
-	die ("%s: not a ROF (no sync bytes)", name);
-      add_equates (&r);
-    }
+  Rof *rofs;
+  int nrofs, i;
+  read_rofs (name, &rofs, &nrofs);
+  for (i = 0; i < nrofs; i++)
+    add_equates (&rofs[i]);
 }
 
 static void
@@ -844,8 +1125,9 @@ usage (void)
   fprintf (stderr,
 	   "usage: %s [-o OUTPUT] [-e EQUFILE]... INPUT\n"
 	   "  Converts a ROF object (.r) to an ELF relocatable, or a ROF\n"
-	   "  library (.l) to an ar archive (run ranlib on it).  OUTPUT\n"
-	   "  defaults to INPUT with .o or .a.\n"
+	   "  library (.l: concatenated ROFs, or Ultra C's libgen format) to\n"
+	   "  an ar archive (run ranlib on it).  OUTPUT defaults to INPUT\n"
+	   "  with .o or .a.\n"
 	   "  -e  also take equ definitions from EQUFILE (a ROF or library,\n"
 	   "      e.g. sys.l), to fold references to them into the code\n"
 	   "  -l  list the ROFs in INPUT and exit\n", progname);
@@ -858,10 +1140,7 @@ main (int argc, char **argv)
   const char *input = NULL, *output = NULL;
   int is_library;
   int list = 0, i, nrofs = 0;
-  unsigned char *data;
-  long size;
   FILE *f;
-  In in;
   Rof *rofs = NULL;
 
   for (i = 1; i < argc; i++)
@@ -880,18 +1159,7 @@ main (int argc, char **argv)
   if (!input)
     usage ();
 
-  data = read_file (input, &size);
-
-  in.p = data;
-  in.end = data + size;
-  in.file = input;
-  while (in.p < in.end)
-    {
-      rofs = realloc (rofs, (nrofs + 1) * sizeof (Rof));
-      if (!parse_rof (&in, &rofs[nrofs]))
-	die ("%s: not a ROF (no sync bytes)", input);
-      nrofs++;
-    }
+  read_rofs (input, &rofs, &nrofs);
   if (nrofs == 0)
     die ("%s: empty", input);
   for (i = 0; i < nrofs; i++)
